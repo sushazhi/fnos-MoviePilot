@@ -1,0 +1,61 @@
+fnos-MoviePilot 第三方组件许可清单
+====================================
+
+本应用（fnos-MoviePilot）为第三方封装包，整体以 GPL-3.0 发布（见 LICENSE）。
+以下列出随包分发的主要第三方组件及其许可证。各组件的具体许可证文本请以其
+上游仓库 / 包内 METADATA 为准；GPL-3.0 全文见仓库根 LICENSE。
+
+核心组件
+--------
+
+- MoviePilot（后端，jxxghp）
+  许可证 : GPL-3.0
+  仓库   : https://github.com/jxxghp/MoviePilot
+  位置   : app/mp/（随包含对应源代码）
+
+- MoviePilot-Frontend（前端，jxxghp）
+  许可证 : GPL-3.0
+  仓库   : https://github.com/jxxghp/MoviePilot-Frontend
+  位置   : app/frontend/
+
+- MoviePilot-Resources（站点资源，jxxghp）
+  许可证 : GPL-3.0
+  仓库   : https://github.com/jxxghp/MoviePilot-Resources
+  位置   : app/mp/app/.../site/（构建时同步）
+
+运行时与工具
+------------
+
+- CPython（自带解释器，python-build-standalone 发行版）
+  许可证 : PSF-2.0（Python Software Foundation License，GPL 兼容）
+  仓库   : https://github.com/astral-sh/python-build-standalone
+  位置   : app/python/（许可证文本见 app/python/LICENSE）
+  说明   : python-build-standalone 项目自身的构建脚本以 MPL-2.0 发布；
+          其分发的 CPython 二进制遵循 PSF-2.0。
+
+- uv（依赖锁定与安装工具，astral-sh）
+  许可证 : MIT 或 Apache-2.0
+  仓库   : https://github.com/astral-sh/uv
+
+- Node.js（前端静态服务运行时，由 fnOS 应用中心提供）
+  许可证 : MIT
+  仓库   : https://github.com/nodejs/node
+
+Python 依赖（app/python/lib/python3.14/site-packages）
+------------------------------------------------------
+
+截至构建时，site-packages 内含数百个第三方包（fastapi、uvicorn、sqlalchemy、
+pydantic、pydantic_core、orjson、langchain、anitopy、pinyin2hanzi 等），
+许可多为 MIT / BSD / Apache-2.0 / MPL-2.0，均兼容 GPL-3.0。
+
+完整且权威的逐包许可证文本位于 fpk 内各包的元数据目录：
+    app/python/lib/python3.14/site-packages/<pkg>-<version>.dist-info/METADATA
+    app/python/lib/python3.14/site-packages/<pkg>-<version>.dist-info/LICENSE
+
+（若需统一汇总，可在构建期从上述 dist-info 抽取生成；本文件为人工维护的
+主要组件清单。）
+
+致谢
+----
+
+上游及镜像项目见 README「感谢与上游仓库」一节。

@@ -1,7 +1,7 @@
 appname               = moviepilot
 version               = 1.0.7
 display_name          = MoviePilot
-desc                  = <b>NAS 媒体库自动化管理工具</b>，支持订阅、搜索、下载、媒体整理与刮削、媒体库刷新及消息通知等核心自动化流程。<br><br>🎬 <b>原生应用：</b>内置 Python 后端与 Web 前端，前后端运行于本地，通过 fnOS 统一网关嵌入桌面访问。<br><br>🐛 <b>问题反馈：</b><a href="https://github.com/jxxghp/MoviePilot/issues" target="_blank">GitHub Issues</a>
+desc                  = <b>NAS 媒体库自动化管理工具</b>，支持订阅、搜索、下载、媒体整理与刮削、媒体库刷新及消息通知等核心自动化流程。<br><br>🎬 <b>原生应用：</b>内置 Python 后端与 Web 前端，前后端运行于本地，通过 fnOS 统一网关嵌入桌面访问。
 
 # 系统要求
 platform              = all

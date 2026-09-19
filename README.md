@@ -279,19 +279,26 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 
 ## 感谢与上游仓库
 
-本应用是在以下优秀开源项目之上进行的 fnOS 原生封装，特此致谢：
+本应用基于以下开源项目封装为 fnOS 原生应用，在此一并致谢：
 
-| 上游仓库 | 说明 |
+| 上游项目 | 说明 |
 |----------|------|
 | [jxxghp/MoviePilot](https://github.com/jxxghp/MoviePilot) | 核心后端（FastAPI 媒体库自动化管理，本包使用的 V3 源码） |
 | [jxxghp/MoviePilot-Frontend](https://github.com/jxxghp/MoviePilot-Frontend) | Vue3 前端（官方预编译 `dist.zip`） |
 | [jxxghp/MoviePilot-Resources](https://github.com/jxxghp/MoviePilot-Resources) | 站点资源（sites 模块 / 索引数据，由独立仓库分发） |
 | [astral-sh/python-build-standalone](https://github.com/astral-sh/python-build-standalone) | 自带可重定位的 CPython 3.14 运行时（随包分发，安装零联网） |
 | [astral-sh/uv](https://github.com/astral-sh/uv) | 依赖锁定与安装（构建期按 `uv.lock` 装配 `site-packages`） |
-| [fnOS 应用中心](https://www.fnnas.com/) | 飞牛 fnOS 原生应用运行环境、统一网关与 Node.js 运行时 |
+| [fnOS 应用中心](https://www.fnnas.com/) | 飞牛 fnOS 提供的运行环境（原生应用框架、统一网关与 Node.js 运行时） |
 
-下载加速依赖 [gh-proxy.com](https://gh-proxy.com/) / [ghfast.top](https://ghfast.top/) 等 GitHub 镜像（直连不通时自动回退）。
+构建与更新时的下载加速由 [gh-proxy.com](https://gh-proxy.com/)、[ghfast.top](https://ghfast.top/) 等 GitHub 镜像提供（直连不通时自动回退），一并致谢。
 
-## 免责声明
+## 许可证与免责声明
 
-MoviePilot 遵循 GPL-3.0 许可证，仅限学习交流。本应用包仅为第三方封装，请自行评估合规与使用风险。
+本应用包（fnos-MoviePilot）**整体基于 GPL-3.0 发布**，封装代码（cmd/、app/bin/、wizard/、build.py 等）同样以 GPL-3.0 授权。许可证全文见仓库根 `LICENSE`，第三方组件许可见 `THIRD-PARTY-LICENSES`。
+
+- **MoviePilot 版权归 [jxxghp](https://github.com/jxxghp/MoviePilot) 所有**，以 GPL-3.0 发布；
+- **MoviePilot-Frontend / MoviePilot-Resources** 版权同样归 jxxghp，以 GPL-3.0 发布；
+- 自带 **CPython**（python-build-standalone 发行版）以 PSF-2.0 发布，其构建脚本以 MPL-2.0 发布；
+- **uv**（astral-sh）以 MIT 或 Apache-2.0 发布；**Node.js** 以 MIT 发布。
+
+GPL-3.0 允许学习、商用与再分发。本应用包仅为第三方封装，请自行评估使用风险。
