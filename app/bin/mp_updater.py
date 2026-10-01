@@ -148,9 +148,15 @@ RESOURCE_SUBDIRS = (
 # 显示 No data available，而文件看起来都在。
 RESOURCE_FLAG = "v3"
 
-# 只认 v3.x.y（可带 alpha/beta/rc 后缀）：上游仓库同时存在 v1/v2 历史 tag 与
-# dev 之类非版本引用，一律不接受，避免"升级"到旧版本或不明引用
-TAG_RE = re.compile(r"^v3\.\d+\.\d+(?:[-.](?:alpha|beta|rc)[.-]?\d*)?$", re.I)
+# 只认 v3.x.y（可带上游的重新打包序号 `-N`，或 alpha/beta/rc 后缀）：上游仓库
+# 同时存在 v1/v2 历史 tag 与 dev 之类非版本引用，一律不接受，避免"升级"到旧版本
+# 或不明引用。
+#
+# 关于 `-N`：上游对**同一个版本重新打包**时会发 v3.0.10-1（v3.0.10 之后、v3.0.11
+# 之前），这是长期惯例（v2.9.16-2、v2.13.8-1、v2.9.5-1 都是），不是预发布。
+# 早期实现只认 `-beta/-rc/-alpha`，于是上游一发 v3.0.10-1 就再也"查不到新版本"
+# （TAG_RE 直接把它滤掉），自更新静默失效 —— 所以这里必须显式接受 `-\d+`。
+TAG_RE = re.compile(r"^v3\.\d+\.\d+(?:-\d+|[-.](?:alpha|beta|rc)[.-]?\d*)?$", re.I)
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -291,23 +297,35 @@ def read_py_value(path: Path, key: str) -> str:
 
 _PRE_RANK = {"": 1, "rc": 0, "beta": -1, "alpha": -2}
 
+# 版本号解析：v3.0.4 / v3.1.0-beta2 / v3.0.10-1。
+# 第 4 组是上游的**重新打包序号**（`-N`），第 5/6 组才是预发布后缀 —— 两者语义
+# 完全不同，必须分开捕获：把 `-1` 当成预发布会把"重新打包"判成比正式版旧。
+_KEY_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:-(\d+)|[-.](alpha|beta|rc)[.-]?(\d*))?", re.I)
+
 
 def version_key(version: str) -> tuple:
-    """把 v3.0.4 / v3.1.0-beta2 变成可比较的元组。
+    """把 v3.0.4 / v3.1.0-beta2 / v3.0.10-1 变成可比较的元组。
 
-    正式版 > rc > beta > alpha，同级别再比序号；完全无法解析的返回 (0,)，
-    保证"看不懂的版本"永远不会被判定为更新。
+    排序规则（由左到右逐段比较）：
+      正式版 > rc > beta > alpha，同级别再比序号；
+      同级正式版里带重新打包序号的更新（v3.0.10-1 > v3.0.10）。
+
+    末位比较"重新打包序号"而不是把它并进前一段，是因为它只在上游**对同一版本
+    重新打包**时出现：不比较它，重打包就会被判成"已是最新"，自更新会永久停在
+    旧包上（上游 v3.0.10 → v3.0.10-1 正是这种情况）。
+
+    完全无法解析的返回 (0,)，保证"看不懂的版本"永远不会被判定为更新。
     """
     if not version:
         return (0,)
-    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-.](alpha|beta|rc)[.-]?(\d*))?",
-                 version.strip(), re.I)
+    m = _KEY_RE.match(version.strip())
     if not m:
         return (0,)
-    pre = (m.group(4) or "").lower()
-    num = int(m.group(5) or 0) if m.group(5) else 0
+    pre = (m.group(5) or "").lower()
+    num = int(m.group(6) or 0) if m.group(6) else 0
+    rebuild = int(m.group(4) or 0) if m.group(4) else 0
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)),
-            _PRE_RANK.get(pre, -3), num)
+            _PRE_RANK.get(pre, -3), num, rebuild)
 
 
 def load_state(cfg: Config) -> dict:
@@ -433,11 +451,16 @@ _TAG_PATH_RE = re.compile(r"/releases/tag/([A-Za-z0-9._\-]+)")
 _OG_URL_RE = re.compile(r"<meta[^>]+property=[\"']og:url[\"'][^>]+content=[\"']([^\"']+)", re.I)
 _CANONICAL_RE = re.compile(r"<link[^>]+rel=[\"']canonical[\"'][^>]+href=[\"']([^\"']+)", re.I)
 _ATOM_ENTRY_RE = re.compile(r"<entry\b.*?</entry>", re.I | re.S)
-_PRE_SUFFIX_RE = re.compile(r"[-.](alpha|beta|rc)", re.I)
+# 预发布后缀。注意不能写成 `[-.]` + 关键词的宽松形式：上游的重新打包序号
+# （v3.0.10-1）是正式版，若把它误判成预发布，正式版通道会把它跳过。
+_PRE_SUFFIX_RE = re.compile(r"(?:^|[-.])(alpha|beta|rc)(?:[.-]?\d*)?$", re.I)
 
 
 def is_prerelease(tag: str) -> bool:
-    """v3.1.0-beta2 / v3.1.0.rc1 是预发布，v3.1.0 不是。"""
+    """v3.1.0-beta2 / v3.1.0.rc1 是预发布，v3.1.0 与 v3.0.10-1 不是。
+
+    v3.0.10-1 是上游对同一版本的**重新打包**（正式版），必须走正式版通道。
+    """
     return bool(_PRE_SUFFIX_RE.search(tag or ""))
 
 

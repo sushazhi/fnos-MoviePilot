@@ -214,6 +214,21 @@ def scenario_d():
     check("D3 rc > beta", vk("v3.1.0-rc1") > vk("v3.1.0-beta2"))
     check("D4 无法解析的版本不参与比较", vk("dev") == (0,) and vk("dev") < vk("v3.0.0"))
     check("D5 相同版本相等", vk("v3.0.3") == vk("3.0.3"))
+    # 上游对同一版本重新打包时会发 v3.0.10-1（长期惯例，见 v2.9.16-2 / v2.13.8-1）。
+    # 旧实现把它当"看不懂的版本"，自更新会永久停在旧包上，所以这几条必须钉住。
+    check("D11 TAG_RE 接受上游重打包 tag", bool(mod.TAG_RE.match("v3.0.10-1")))
+    check("D12 TAG_RE 仍拒绝 v1/v2/dev 与非版本引用",
+          not any(mod.TAG_RE.match(t) for t in
+                  ("v1.9.19", "v2.9.5", "dev", "v3.0", "v3.0.10-1-2")))
+    check("D12b 预发布 tag 仍被 TAG_RE 接受（由通道过滤，而非拒之门外）",
+          bool(mod.TAG_RE.match("v3.0.10-beta2")) and mod.is_prerelease("v3.0.10-beta2"))
+    check("D13 重打包 > 同版本正式版", vk("v3.0.10-1") > vk("v3.0.10"))
+    check("D14 下一版本 > 重打包版", vk("v3.0.11") > vk("v3.0.10-1"))
+    check("D15 重打包序号参与排序", vk("v3.0.10-2") > vk("v3.0.10-1"))
+    check("D16 重打包不算预发布",
+          not mod.is_prerelease("v3.0.10-1") and mod.is_prerelease("v3.0.10-rc1"))
+    check("D17 正式版仍 > 同版本预发布",
+          vk("v3.0.10-1") > vk("v3.0.10-rc1") and vk("v3.0.10") > vk("v3.0.10-beta2"))
 
     if not REAL_SRC.exists():
         print("SKIP 依赖相关用例：缺少 .local-build/_src/v303 上游源码")
@@ -440,7 +455,31 @@ def scenario_h():
           len(seen) == 1 and seen[0][1] == (), str(seen))
     mod.http_json, mod.fetch_text = real_json, real_text
 
-    # 版本发现失败：只冷却 RETRY_AFTER_FAILURE，不占用整个检查周期
+    # 上游"对同一版本重新打包"的 tag（v3.0.10-1）必须能走完整条发现链。
+    # 真实故障：上游发了 v3.0.10-1 之后，旧 TAG_RE 把它滤掉，正式版通道在
+    # API / 网页 / atom 三处都"找不到版本"，自更新静默失效。
+    mod.http_json = lambda *a, **k: {"tag_name": "v3.0.10-1", "name": "v3.0.10-1"}
+    mod.fetch_text = lambda *a, **k: (None, "")
+    tag, _meta = mod.fetch_latest_release(mod.Config())
+    check("H16 API 返回重打包 tag 时被接受", tag == "v3.0.10-1", f"tag={tag}")
+
+    atom_rebuild = ('<feed>'
+                    '<entry><link rel="alternate" href="https://github.com/jxxghp/MoviePilot'
+                    '/releases/tag/v3.0.10-1"/><title>v3.0.10-1</title>'
+                    '<updated>2026-09-28T10:40:38Z</updated></entry>'
+                    "</feed>")
+    mod.http_json = lambda *a, **k: None
+    mod.fetch_text = lambda url, *a, **k: (None, atom_rebuild if "atom" in url else "")
+    tag, _meta = mod.fetch_latest_release(mod.Config())
+    check("H17 正式版通道不把重打包 tag 当预发布跳过",
+          tag == "v3.0.10-1", f"tag={tag}")
+
+    # 上游发新版本后必须能从重打包版继续前进（否则会永久停在 v3.0.10-1）
+    mod.http_json = lambda *a, **k: {"tag_name": "v3.0.11", "name": "v3.0.11"}
+    tag, _meta = mod.fetch_latest_release(mod.Config())
+    check("H18 新版本能被发现（重打包不是终点）", tag == "v3.0.11", f"tag={tag}")
+    mod.http_json, mod.fetch_text = real_json, real_text
+
     mp, fe, cfgdir = build_sandbox()
     (cfgdir / "temp" / "moviepilot-update" / "install.json").unlink()  # 逼它走联网查版本
     os.environ["MP_UPDATE_INTERVAL"] = "21600"

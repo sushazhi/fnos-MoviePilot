@@ -110,8 +110,15 @@ MoviePilot V3 的 `pyproject.toml` 声明 `requires-python >= 3.14`，而 fnOS �
 ├── manifest
 ├── build.py                    # 跨平台构建脚本（推荐）
 ├── tools/
+│   ├── bump_upstream.py        # 上游版本检查/升级：改 build.py 的 pin + 同步 manifest（CI 每周跑，本地也可跑）
 │   ├── updater_smoke.py        # 自更新器离线冒烟测试（沙箱，Windows 亦可跑）
+│   ├── resources_smoke.py      # 站点资源修复/回填的离线冒烟测试
+│   ├── supervisor_smoke.py     # 进程托管（失败计数/退避/重启）的离线冒烟测试
+│   ├── cmd_env_smoke.py        # 生命周期脚本 app.env 生成逻辑的离线冒烟测试（需 bash）
 │   └── polyfill_smoke.py       # 代理注入的 JS polyfill 冒烟测试（需 node，缺失则 SKIP）
+├── .github/workflows/
+│   ├── check-upstream.yml      # 每周二检查上游 → 改 pin/manifest → 打 tag → 派发构建
+│   └── build-and-release.yml   # 分架构打包并创建 Release
 ├── ICON.PNG / ICON_256.PNG
 └── README.md
 ```
@@ -138,7 +145,7 @@ python build.py --with-runtime --no-build
 > `--with-venv` 仍可用，是 `--with-runtime` 的兼容别名（早期版本打包的是 venv，现已改为自带解释器）。
 
 构建脚本会自动：
-1. 从 GitHub 下载 MoviePilot V3 源码到 `.local-build/mp`（打包内置）
+1. 从 GitHub 下载 MoviePilot V3 源码到 `.local-build/mp`（打包内置）。**下载的是 `build.py` 里 `UPSTREAM_TAG` 钉住的那个上游 tag**（当前 `v3.0.10-1`），而不是每次去查 `releases/latest` —— 同一个 tag 的包必须可复现，否则上游一发新版，重跑同一次构建就会悄悄换成新代码，而包名还写着旧版本。升级上游就是改这一个常量（`tools/bump_upstream.py` 自动改，并同步 `manifest`）；只有该 tag 在上游被**确定性删除**（API 404）时才回退到 `releases/latest`
 2. 从 GitHub Releases 下载前端 `dist.zip` 到 `.local-build/frontend`（打包内置）
 3. 同步 MoviePilot-Resources 资源包到后端源码的站点资源目录（V3 必需；目录名随上游重构变过，`app/helper` → `app/application/site`，构建时按源码结构自动定位，缺失会报 `No module named 'app.application.site.sites'`）
 4. （可选 `--with-runtime`）下载 CPython 3.14.7 到 `.local-build/python`，用 `uv` 按 `uv.lock` 装依赖，并做三道自检（依赖自检 / wheel glibc 审计 / 关键路径断言）
@@ -150,11 +157,18 @@ python build.py --with-runtime --no-build
 
 ### GitHub Actions 自动构建（分架构 + 自带 Python 运行时）
 
-仓库已内置 `.github/workflows/build-and-release.yml`，可在 CI 上自动分架构打包：
+仓库内置两个 workflow：
+
+| workflow | 作用 | 触发 |
+|----------|------|------|
+| `.github/workflows/check-upstream.yml` | 检查上游有没有新版本，有就改 pin + 改 manifest → 提交 → 打 tag → 派发构建 | **每周二** 03:23 UTC（北京时间 11:23），或手动 `workflow_dispatch` |
+| `.github/workflows/build-and-release.yml` | 分架构打包并创建 Release | 上面派发、push `v*` tag，或手动 `workflow_dispatch`（只构建不发 Release） |
+
+`build-and-release.yml`：
 
 - **触发方式**：
+  - 打标签发布：`git tag v3.0.10-1 && git push origin v3.0.10-1`（自动生成 Release 并附带 changelog）
   - 手动触发：Actions 页点 `workflow_dispatch`（只构建，不发 Release）
-  - 打标签发布：`git tag v1.1.3104 && git push origin v1.1.3104`（自动生成 Release 并附带 changelog）
 - 推分支**不会**触发这个 workflow —— 单架构十几分钟、产物 250 MB，每次提交都跑不划算。
 
 > 打 tag 前先确认 `manifest` 的 `version` 已同步改动：CI 会校验 tag 与 manifest 版本一致，
@@ -162,9 +176,31 @@ python build.py --with-runtime --no-build
 - **分架构矩阵**：`amd64`（ubuntu-latest）、`arm64`（ubuntu-24.04-arm）
 - **自带运行时**：每个架构的 runner 上执行 `python build.py --with-runtime --arch <arch>`，把该架构的 CPython 3.14 与依赖打进包，安装时**完全无需联网**
 - **产物校验**：打包后会嵌套解开 `app.tgz`，断言 `app/python/bin/python3`、`lib/python3.14/site-packages` 存在，并抽查 `fastapi/uvicorn/sqlalchemy/pydantic_core/orjson` —— 防止再次出现「CI 全绿但包里没有依赖」的静默失败
-- **产物命名**：`moviepilot-<version>-<arch>.fpk`（如 `moviepilot-1.1.3104-amd64.fpk`）
+- **产物命名**：`moviepilot-<version>-<arch>.fpk`（如 `moviepilot-3.0.10-1-amd64.fpk`）
 
 > 说明：打包前会在 `.local-build/pkg/` 组装干净的应用目录树（只含该进包的内容），再调用 fnpack 打包，因此包内不会混入任何构建缓存/临时文件。
+
+### 每周自动跟进上游（`check-upstream.yml`）
+
+每周二定时检查上游 `jxxghp/MoviePilot` 的最新 tag：**有更新就改 `build.py` 的 `UPSTREAM_TAG`
+pin 与 `manifest`（`version` + `changelog`）→ 提交 master → 打同名 tag → 派发构建**；
+**没更新则整条流水线只做一次几秒钟的空转，不改任何文件、不发 Release**。
+
+- **版本号就是上游 tag**（去掉前导 `v`）：上游 `v3.0.10-1` → 应用版本 `3.0.10-1`。
+  上游对同一版本重新打包时会发 `-N` 后缀（`v2.9.16-2`、`v3.0.10-1`），这是正式版而非预发布，
+  所以 `-N` 也照常算作新版本。
+- **为什么要单独一个 workflow**：GitHub 有一条硬规则 —— 用内置 `GITHUB_TOKEN` 推送的 tag
+  **不会触发其它 workflow**（防递归）。所以「push tag → 由 tag 触发构建」这条路走不通：
+  tag 会推上去，但构建永远不会开始，而且 pin 已提交，下次检查会判定「无更新」，
+  这个版本就永远不会有 Release。只有 `workflow_dispatch` / `repository_dispatch` 被排除在该规则之外，
+  因此改成显式**派发** `build-and-release.yml`（所以本 workflow 需要 `actions: write`）。
+- **幂等 / 自愈**：提交成功后下次检查读到的 pin 已是最新，直接跳过；万一「提交成功但派发失败」，
+  下次运行会发现「tag 在、Release 不在」并自动补派发一次。
+- **强制重打当前版本**：手动跑本 workflow 并勾上 `force`（用于验证流水线）。
+- **手动补发某个版本**：跑 `build-and-release.yml`，ref 填对应 tag。
+
+> 本地也可以跑同一套逻辑（不需要 CI）：`python tools/bump_upstream.py --detect` 只看有没有更新，
+> `--apply` 真去改文件；不带 `GITHUB_TOKEN` 时受匿名 API 限流（60 次/小时）。
 
 ## 安装
 
@@ -221,6 +257,8 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 
 1. 读本地版本（`mp/version.py`）→ 查上游最新版本 → 版本更高才继续（无更新时只做一次 API 查询，秒级返回）
    版本发现是**四级降级**：`api.github.com` **直连**（不走加速）→ 网页 `releases/latest` → `releases.atom` → 分支 `version.py`（raw 文件型 URL）。后三级都落在 `github.com` / `raw.githubusercontent.com` 上、可走加速前缀 —— 加速镜像普遍只转发「文件」型 URL（实测 gh-proxy 对 releases 网页直接 403/404，对归档与 raw 正常），所以「下载得动」的通道一定也「查得到版本」
+   > tag 形态认 `v3.x.y` 与上游的重新打包序号 `v3.x.y-N`（如 `v3.0.10-1`，正式版而非预发布，
+   > 且 `v3.0.10-1 > v3.0.10`）；v1/v2 历史 tag 与 `dev` 之类非版本引用一律不接受。
 2. 下载后端 zip → 校验结构（有 `app/`、`version.py` 与 tag 一致）→ 解析出 `FRONTEND_VERSION`
 3. 依赖预检：用新 `uv.lock` 对比已装环境，缺什么补什么（`pip`，走国内镜像）
 4. 备份 → 替换 `app/ config/ database/ scripts/ skills/ moviepilot/` 与 `version.py` 等 → **回填资源包文件**（sites 二进制来自独立仓库，上游 zip 里没有）→ 校验资源在位（缺失直接判更新失败并回滚）
@@ -274,6 +312,7 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 - 自更新只替换后端源码与前端静态文件，不替换自带 Python 运行时（`app/python/`）；新版本引入新依赖时由更新器用 pip 增量补装（需要联网，走国内镜像）
 - 自更新要求应用目录可写（`TRIM_APPDEST`）。目录只读时会跳过更新并记日志，此时只能通过重新安装应用包升级
 - 默认使用 **SQLite**；如需 PostgreSQL，可在 `app.env` 中设置 `DB_TYPE=postgresql` 并配置连接（需 fnOS 安装 PostgreSQL）
+- **版本号已改为上游派生**：`manifest` 的 `version` 与上游 tag 逐字对应（去前导 `v`），例如上游 `v3.0.10-1` → 本包 `3.0.10-1`。因此 git tag 从旧的 `v1.0.x` 系列跳到 `v3.0.10-1`，不再有本地构建计数器 —— 「换了哪份上游」一眼可见，也便于与上游 Release 对照
 - 后端源码、前端产物、自带 Python 运行时、fnpack 工具、下载缓存等**所有构建产物全部收敛在 `.local-build/`，不纳入 git**，由构建脚本生成；拉取仓库后需先执行构建脚本，项目根目录不残留任何构建产物
 - 首个登录使用安装向导设置的管理员账号
 

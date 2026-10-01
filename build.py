@@ -68,6 +68,7 @@ import hashlib
 import platform
 import re
 import subprocess
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -106,6 +107,23 @@ UV_PLATFORM = {
     "amd64": f"x86_64-manylinux_{GLIBC_BASELINE[0]}_{GLIBC_BASELINE[1]}",
     "arm64": f"aarch64-manylinux_{GLIBC_BASELINE[0]}_{GLIBC_BASELINE[1]}",
 }
+
+# ---------------------------------------------------------------------------
+# 上游 MoviePilot 版本 pin（唯一「集成的是哪份上游」的声明）
+# ---------------------------------------------------------------------------
+# 为什么写死 tag，而不是每次构建都去查 releases/latest：
+#   同一个 tag 的包必须可复现。上游一发新版，重跑同一次构建就会悄悄换成新代码，
+#   而 manifest / git tag 还写着旧版本 —— 于是出现「包名说 A、内容其实是 B」，
+#   且这种错在发布后极难发现。pin 之后「取哪份源码」是确定的常量，
+#   升级上游 == 改这一个常量（tools/bump_upstream.py 自动改，并同步 manifest）。
+# 取不到该 tag（被删/改名）时才回退到 releases/latest，并打警告。
+# 注意上游自己会用 `-N` 表示「同一版本的重新打包」（如 v3.0.10-1），
+# 所以 tag 形态是 v3.x.y 或 v3.x.y-N，本仓库的 manifest.version 直接沿用该版本号。
+UPSTREAM_REPO = "jxxghp/MoviePilot"
+UPSTREAM_TAG = "v3.0.10-1"
+# 前端仓库：发布 dist.zip 的 Release tag 由后端源码的 FRONTEND_VERSION 决定，
+# 不跟随 UPSTREAM_TAG（后端 v3.0.10-1 重新打包时前端仍是 v3.0.10）。
+UPSTREAM_FE_REPO = "jxxghp/MoviePilot-Frontend"
 
 # 打进包的仓库源码目录（相对项目根），会被组装进 pkg/app 及 pkg/
 SRC_DIRS = ["cmd", "config", "wizard"]
@@ -195,20 +213,51 @@ def get_frontend_version():
     return "v3.0.0"
 
 
-def get_backend_version():
-    """从 GitHub API 动态获取 MoviePilot 后端最新 release tag（如 v3.0.0）。
+def upstream_tag_exists(tag):
+    """探测上游 tag 是否仍存在，返回 True / False / None（None = 探测本身失败，未知）。
 
-    优先按稳定 release tag 拉取，避免写死 v3 开发分支导致版本漂移。
-    无法访问时回退到 v3 分支。返回 (tag 或分支标识, 是否为 tag)。
+    用 git/ref/tags/<tag> 而不是 releases/tags/<tag>：上游并非每个 tag 都发 Release，
+    而 git ref 对轻量标签与附注标签都成立。只看 404 这一个确定性信号：403（限流）、
+    超时、网络不通一律返回 None —— 不能把"查不到"当成"不存在"，否则限流时构建会
+    悄悄回退到 releases/latest，正好破坏了 pin 的可复现性。
     """
+    api_url = f"https://api.github.com/repos/{UPSTREAM_REPO}/git/ref/tags/{tag}"
+    req = urllib.request.Request(api_url, headers={"User-Agent": "fnos-build"})
     try:
-        api_url = "https://api.github.com/repos/jxxghp/MoviePilot/releases/latest"
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 200
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        return None
+    except Exception:
+        return None
+
+
+def get_backend_version():
+    """返回要构建的上游后端 (ref, 是否为 tag)。
+
+    1. UPSTREAM_TAG pin —— 默认路径，构建可复现（见该常量处的注释）
+    2. releases/latest —— 仅当 pin 被上游**确定性地**删掉/改名（404）时兜底
+    3. v3 分支        —— 连 API 都不可用时的最后退路
+
+    注意：只有 404 才降级。限流/网络故障时坚持用 pin，因为「取不到最新版」远好过
+    「静默换了源码却还叫旧版本号」。
+    """
+    if UPSTREAM_TAG:
+        exists = upstream_tag_exists(UPSTREAM_TAG)
+        if exists is not False:
+            log(f"==> 后端上游 tag（pin）: {UPSTREAM_TAG}")
+            return UPSTREAM_TAG, True
+        log(f"警告: pin 的 tag {UPSTREAM_TAG} 在上游已不存在，回退到 releases/latest")
+    try:
+        api_url = f"https://api.github.com/repos/{UPSTREAM_REPO}/releases/latest"
         req = urllib.request.Request(api_url, headers={"User-Agent": "fnos-build"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         tag = (data or {}).get("tag_name")
         if tag:
-            log(f"==> 后端最新 release: {tag}")
+            log(f"警告: 未使用 pin，改用后端最新 release: {tag}（manifest 版本可能已脱节）")
             return tag, True
     except Exception as e:
         log(f"警告: 获取后端最新 release 失败，回退到 v3 分支: {e}")
@@ -266,9 +315,9 @@ def fetch_moviepilot(force=False):
         log("==> MoviePilot 源码已存在，跳过")
         return
     backend_ref, is_tag = get_backend_version()
-    src_url = (f"https://github.com/jxxghp/MoviePilot/archive/refs/tags/{backend_ref}.zip"
+    src_url = (f"https://github.com/{UPSTREAM_REPO}/archive/refs/tags/{backend_ref}.zip"
                if is_tag else
-               f"https://github.com/jxxghp/MoviePilot/archive/refs/heads/{backend_ref}.zip")
+               f"https://github.com/{UPSTREAM_REPO}/archive/refs/heads/{backend_ref}.zip")
     log(f"==> 下载 MoviePilot 源码 [{backend_ref}] ...")
     if mp_dir.exists():
         shutil.rmtree(mp_dir)
@@ -300,7 +349,7 @@ def fetch_frontend(force=False):
     if fe_dir.exists():
         shutil.rmtree(fe_dir)
     zip_path = BUILD_DIR / "frontend.zip"
-    url = f"https://github.com/jxxghp/MoviePilot-Frontend/releases/download/{frontend_tag}/dist.zip"
+    url = f"https://github.com/{UPSTREAM_FE_REPO}/releases/download/{frontend_tag}/dist.zip"
     if not download(url, zip_path, force):
         log("下载前端失败")
         sys.exit(1)

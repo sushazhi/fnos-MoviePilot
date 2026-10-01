@@ -1,5 +1,5 @@
 appname               = moviepilot
-version               = 1.0.7
+version               = 3.0.10-1
 display_name          = MoviePilot
 desc                  = <b>NAS 媒体库自动化管理工具</b>，支持订阅、搜索、下载、媒体整理与刮削、媒体库刷新及消息通知等核心自动化流程。<br><br>🎬 <b>原生应用：</b>内置 Python 后端与 Web 前端，前后端运行于本地，通过 fnOS 统一网关嵌入桌面访问。
 
@@ -31,4 +31,4 @@ desktop_applaunchname = moviepilot.Application
 install_dep_apps      = nodejs_v24
 
 # 更新日志
-changelog             = v1.0.7<br>1.修复<b>自动更新永久失效</b>：依赖清单里的平台专属包（pyobjc-*、pywin32 等）此前被当作 Linux 依赖去安装，必然失败并整体回滚；现在按 PEP 508 marker 过滤，并且“上游锁文件引用了尚未发布到镜像的版本”时只跳过该包继续更新（本机未装的仍会报错）<br>2.修复应用内自更新后配置目录属主未收敛导致的 SQLite “attempt to write a readonly database”：升级成功后与安装/升级回调同一口径递归修正属主，避免写配置/写库时报只读<br>3.修复日志每行重复两遍（更新器、安装、配置三处的重复重定向）<br>4.内存优化：限制 malloc arena（实测 VmSize 2.7GB→0.77GB、RSS 约降 10~20%），并新增内存看门狗——后端持续超阈值时自动回收；阈值与开关可在 app.env 调整，x86_64 与 ARM 通用<br>5.构建脚本依赖安装改走国内镜像，不再直连 pypi.org
+changelog             = v3.0.10-1<br>1.跟进上游 MoviePilot v3.0.10-1：构建 pin 与 manifest 版本同步更新，包名版本与上游 tag 一一对应<br>2.上游源码零改动原样集成，仅做 fnOS 打包适配（生命周期脚本、统一网关、桌面入口）<br>3.自带 CPython 3.14.7 运行时与全部依赖，安装时无需联网<br>4.本条目由 GitHub Actions 定时检查上游后自动生成
