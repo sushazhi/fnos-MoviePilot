@@ -154,7 +154,8 @@ python build.py --with-runtime --no-build
 
 **所有下载/解压/构建产物统一收敛到 `.local-build/`（已 gitignore，不入库）**，项目根目录不残留任何构建产物。
 
-> 下载策略：**先直连 GitHub，直连不通再自动切换到 `gh-proxy.com` / `ghfast.top` 加速代理**，避免 GitHub 被限时卡死。
+> 下载策略：**先直连 GitHub，直连不通再按内置加速前缀列表依次降级**（`gh.dpik.top` → `v4.gh-proxy.org`，见 `build.py` 的 `PROXIES`），避免 GitHub 被限时卡死。
+> ⚠️ 本机实测直连 `github.com` 已完全不可用（归档 zip / Release / raw 全部超时），加速前缀是当前唯一可用的下载通道。
 
 ### GitHub Actions 自动构建（分架构 + 自带 Python 运行时）
 
@@ -274,7 +275,7 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 ### 工作流程
 
 1. 读本地版本（`mp/version.py`）→ 查上游最新版本 → 版本更高才继续（无更新时只做一次 API 查询，秒级返回）
-   版本发现是**四级降级**：`api.github.com` **直连**（不走加速）→ 网页 `releases/latest` → `releases.atom` → 分支 `version.py`（raw 文件型 URL）。后三级都落在 `github.com` / `raw.githubusercontent.com` 上、可走加速前缀 —— 加速镜像普遍只转发「文件」型 URL（实测 gh-proxy 对 releases 网页直接 403/404，对归档与 raw 正常），所以「下载得动」的通道一定也「查得到版本」
+   版本发现是**四级降级**：`api.github.com` **直连**（不走加速）→ 网页 `releases/latest` → `releases.atom` → 分支 `version.py`（raw 文件型 URL）。后三级都落在 `github.com` / `raw.githubusercontent.com` 上、可走加速前缀 —— 加速镜像普遍只转发「文件」型 URL（实测当前两个镜像 `gh.dpik.top` / `v4.gh-proxy.org` 对 releases 网页/订阅源分别返回 404 与 403/301，对归档与 raw 正常），所以第 2、3 级在这两个镜像下都会失败，实际可用的是第 1 级（API 直连）与第 4 级（raw）
    > tag 形态认 `v3.x.y` 与上游的重新打包序号 `v3.x.y-N`（如 `v3.0.10-1`，正式版而非预发布，
    > 且 `v3.0.10-1 > v3.0.10`）；v1/v2 历史 tag 与 `dev` 之类非版本引用一律不接受。
 2. 下载后端 zip → 校验结构（有 `app/`、`version.py` 与 tag 一致）→ 解析出 `FRONTEND_VERSION`
@@ -337,8 +338,13 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 | `MP_UPDATE_INTERVAL` | `21600` | 检查间隔（秒），避免每次重启都查 GitHub；**站点资源共用此间隔，各记各的时间戳** |
 | `MP_UPDATE_DEPS` | `1` | 是否同步 Python 依赖；关闭且新版本有新增依赖时会**拒绝更新**（避免装出起不来的版本） |
 | `MP_AUTO_UPDATE_RESOURCE` | `1` | 是否同步站点资源（认证扩展 + 索引），应用设置里有下拉可选 |
-| `GITHUB_PROXY` | `https://gh-proxy.com/` | 加速前缀，**只作用于 `github.com` 系 URL**（归档下载、网页兜底版本发现）；`api.github.com` 一律直连，不受它影响 |
-| `GITHUB_PROXY_MIRRORS` | 空 | 额外加速前缀，逗号分隔（如 `https://a/,https://b/`）。内置镜像失效时可不动代码换一批 |
+| `GITHUB_PROXY` | `https://gh.dpik.top/` | 加速前缀，**只作用于 `github.com` 系 URL**（归档下载、网页兜底版本发现）；`api.github.com` 一律直连，不受它影响 |
+| `GITHUB_PROXY_MIRRORS` | `https://v4.gh-proxy.org/` | 额外加速前缀，逗号分隔（如 `https://a/,https://b/`）。内置镜像失效时可不动代码换一批 |
+
+> 内置加速前缀顺序：`gh.dpik.top` → `v4.gh-proxy.org`（可用 `GITHUB_PROXY` / `GITHUB_PROXY_MIRRORS` 覆盖或追加）。
+> ⚠️ `v4.gh-proxy.org` 必须带 `v4.` 前缀，裸 `gh-proxy.org` 基本不通。
+> 已从内置列表移除：`gh-proxy.com` / `gh-proxy.org`（本机连不上或速度≈0，60s 只收到 0.5MB）；`ghfast.top`（对 `jxxghp/*` 全量返回 `403 Forbidden by black list`，对本项目无效）。
+> ⚠️ `gh.dpik.top` 是个人运营的第三方服务，仅作加速用途；介意供应链风险可自行换成自建或可信镜像。
 
 > 版本发现失败时不占用整个检查间隔：只冷却 15 分钟就重试（网络抖动不该让自动更新停摆半天）。
 > 四级降级带时间预算（API 直连 15s、单次请求 10s、整体 120s），所以更新检查不会把启动拖成几分钟。
@@ -397,7 +403,7 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 | [astral-sh/uv](https://github.com/astral-sh/uv) | 依赖锁定与安装（构建期按 `uv.lock` 装配 `site-packages`） |
 | [fnOS 应用中心](https://www.fnnas.com/) | 飞牛 fnOS 提供的运行环境（原生应用框架、统一网关与 Node.js 运行时） |
 
-构建与更新时的下载加速由 [gh-proxy.com](https://gh-proxy.com/)、[ghfast.top](https://ghfast.top/) 等 GitHub 镜像提供（直连不通时自动回退），一并致谢。
+构建与更新时的下载加速由 [gh.dpik.top](https://gh.dpik.top/)、[v4.gh-proxy.org](https://v4.gh-proxy.org/) 等 GitHub 镜像提供（直连不通时自动回退），一并致谢。
 
 ## 许可证与免责声明
 

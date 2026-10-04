@@ -99,21 +99,33 @@ FRONTEND_ZIP = "https://github.com/{repo}/releases/download/{tag}/dist.zip"
 
 # 不依赖 api.github.com 的版本发现入口（三级降级的后两级，见 fetch_latest_release）。
 # api.github.com 是**独立的域名**，而加速镜像多半只转发 github.com / raw：
-# 一旦镜像不转发 api，请求会一直挂到 SSL 握手超时（实测 ghfast.top 就是这样）。
+# 一旦镜像不转发 api，请求会一直挂到 SSL 握手超时（实测 ghfast.top / gh-proxy.org），
 # 改用网页端后，"查得到版本"与"下得动包"落在同一批通道上 —— 能下包就一定查得到版本。
 WEB_LATEST = "https://github.com/{repo}/releases/latest"
 WEB_ATOM = "https://github.com/{repo}/releases.atom"
 
 # 最后一级：分支上的 version.py（raw 文件型 URL）。
 # 价值在于 raw 是**文件**型 URL —— 几乎每个镜像都转发它，而同一个镜像对 releases
-# 网页/订阅源往往直接 403 / 404（实测 gh-proxy.com 就是如此）。也就是说：当所有
-# "页面型"通道都不可用时，这一级仍然能通过加速镜像查到版本。
+# 网页/订阅源往往直接 403 / 404（实测 gh-proxy.com 与 gh-proxy.org 就是如此）。
+# 也就是说：当所有"页面型"通道都不可用时，这一级仍然能通过加速镜像查到版本。
 # 分支名是上游的内部选择，所以候选多个；main 上是 v1.9.19，会被 TAG_RE 自然滤掉。
 RAW_VERSION = "https://raw.githubusercontent.com/{repo}/{ref}/version.py"
 RAW_REFS = ("v3", "main", "master")
 
-# 加速前缀（顺序即尝试顺序），只作用于 github.com 系 URL
-DEFAULT_PROXIES = ("https://gh-proxy.com/", "https://ghfast.top/")
+# 加速前缀（顺序即尝试顺序），只作用于 github.com 系 URL。
+# 实测（本机 curl，125MB 大文件 + 本项目真实资产，各 3 轮）：
+#   gh.dpik.top      125MB 9~14s / 4~14 MB/s，3/3 成功  —— 最快
+#   v4.gh-proxy.org  125MB 12~18s / 7~10 MB/s，3/3 成功  —— 次之，波动最小
+# ⚠️ 本机直连 github.com 已完全不可用（归档 zip / Release / raw 全部超时），
+#    加速前缀是唯一可用的下载通道，这两项都必须保持有效。
+# 注意 v4.gh-proxy.org 只有带 v4. 前缀的子域可用，裸 gh-proxy.org 基本不通。
+# 网页/订阅源型 URL 两者都不转发（gh.dpik.top 404 / v4.gh-proxy.org 403·301），
+# 所以四级降级里的第 2、3 级（releases/latest、releases.atom）在这两个镜像下都会
+# 失败；第 1 级（api.github.com 直连）与第 4 级（raw version.py）仍然可用。
+# 已移除 gh-proxy.com / gh-proxy.org：本机连不上或速度≈0（60s 只收到 0.5MB）。
+# 已移除 ghfast.top：它对 jxxghp/* 全量返回 403 Forbidden by black list，
+# 对本项目完全无效，留着只会白等一个失败周期。
+DEFAULT_PROXIES = ("https://gh.dpik.top/", "https://v4.gh-proxy.org/")
 
 # 传给 http_json 表示"不加任何加速前缀，只直连"。api.github.com 必须走这个：
 # 镜像对 api 域名的支持参差不齐，不支持时不会快速失败，而是一直挂到 SSL 握手

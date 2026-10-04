@@ -243,7 +243,7 @@ mp_env_bootstrap() {
         mp_env_ensure "${env_file}" "NGINX_PORT" "${nginx_port}"
         mp_env_ensure "${env_file}" "DB_TYPE" "sqlite"
         mp_env_ensure "${env_file}" "API_TOKEN" "${api_token}"
-        mp_env_ensure "${env_file}" "GITHUB_PROXY" "https://gh-proxy.com/"
+        mp_env_ensure "${env_file}" "GITHUB_PROXY" "https://gh.dpik.top/"
         mp_env_ensure "${env_file}" "MP_AUTO_UPDATE" "1"
         mp_env_ensure "${env_file}" "MP_UPDATE_CHANNEL" "release"
         mp_env_ensure "${env_file}" "MP_UPDATE_INTERVAL" "21600"
@@ -287,8 +287,11 @@ SECRET_KEY=${secret}
 RESOURCE_SECRET_KEY=${resource_secret}
 SUPERUSER=${wizard_superuser:-admin}
 SUPERUSER_PASSWORD=${wizard_superuser_password:-}
-# GitHub 加速代理：后端启动时下载/更新资源包（sites.so 等）走国内镜像，避免直连超时
-GITHUB_PROXY=https://gh-proxy.com/
+# GitHub 加速代理：后端启动时下载/更新资源包（sites.so 等）走国内镜像，避免直连超时。
+# 单值通道，上游 MoviePilot 的资源包下载也读它；更新器的完整降级链见下一行。
+GITHUB_PROXY=https://gh.dpik.top/
+# 额外加速前缀（更新器专用，逗号分隔，按顺序降级）：内置列表失效时改这里即可，无需改代码
+GITHUB_PROXY_MIRRORS=https://v4.gh-proxy.org/
 # 自动更新：应用每次启动（重启）前检查上游 Release 并就地升级，无需重新构建安装包
 MP_AUTO_UPDATE=1
 # 更新通道：release=仅正式版 / prerelease=含测试版 / off=关闭

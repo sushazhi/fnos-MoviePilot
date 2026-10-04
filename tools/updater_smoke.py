@@ -444,17 +444,32 @@ def scenario_h():
     mod.http_json, mod.fetch_text = real_json, real_text
 
     # 镜像配置：GITHUB_PROXY_MIRRORS 逗号分隔追加，非法项忽略，与内置项去重
-    os.environ["GITHUB_PROXY"] = "https://gh-proxy.com/"
+    os.environ["GITHUB_PROXY"] = "https://mirror-a.example/"
     os.environ["GITHUB_PROXY_MIRRORS"] = "https://a.example/ , not-a-url , https://b.example"
     check("H12 镜像列表去重保序",
-          mod.Config().proxies[:3] == ("https://gh-proxy.com/", "https://a.example/",
+          mod.Config().proxies[:3] == ("https://mirror-a.example/", "https://a.example/",
                                        "https://b.example/"),
           str(mod.Config().proxies))
     os.environ.pop("GITHUB_PROXY_MIRRORS", None)
     os.environ.pop("GITHUB_PROXY", None)
 
+    # 内置列表的**顺序**是契约：gh.dpik.top 必须排第一（实测最快），v4.gh-proxy.org 次之；
+    # 已失效的镜像（ghfast.top 对 jxxghp/* 全量 403；gh-proxy.com / gh-proxy.org 本机
+    # 连不上或速度≈0）必须不在列表里，留着只会白等一个失败周期。用真实常量而非硬编码
+    # 字符串，避免改常量时测试跟着一起改。
+    check("H18 内置镜像顺序与内容正确",
+          mod.DEFAULT_PROXIES == ("https://gh.dpik.top/", "https://v4.gh-proxy.org/")
+          and all(p.endswith("/") for p in mod.DEFAULT_PROXIES),
+          str(mod.DEFAULT_PROXIES))
+
+    # 只有带 v4. 前缀的子域可用，裸 gh-proxy.org 基本不通 —— 写错就整条通道失效。
+    check("H19 代理前缀带 v4. 子域",
+          all("gh-proxy.org" not in p or p == "https://v4.gh-proxy.org/"
+              for p in mod.DEFAULT_PROXIES),
+          str(mod.DEFAULT_PROXIES))
+
     # API 必须只直连：带上加速前缀时，不转发 api 的镜像会挂到 SSL 握手超时而不是
-    # 快速报错，白白拖长启动路径的更新检查（实测 ghfast.top）。
+    # 快速报错，白白拖长启动路径的更新检查（实测 ghfast.top / gh-proxy.org）。
     seen = []
     mod.http_json = lambda url, proxies, **k: (seen.append((url, proxies)), None)[1]
     mod.fetch_text = lambda *a, **k: (None, "")

@@ -57,7 +57,7 @@ MoviePilot fnOS 应用 跨平台构建脚本（推荐，Windows / Linux / macOS 
 
 说明：
   本应用为 Python 后端 + 预编译前端，无需交叉编译原生二进制、无需 npm 构建。
-  外部资源下载走代理降级（gh-proxy.com / ghfast.top / 直连）。
+  外部资源下载走代理降级（直连 → 内置加速前缀列表，见 PROXIES）。
 """
 import os
 import sys
@@ -83,8 +83,18 @@ PYTHON_DIR = BUILD_DIR / "python"             # 自带 Python 运行时 + 依赖
 VERSION_FILE = BUILD_DIR / "versions.json"
 
 FNPACK_VERSION = "1.2.3"
-MAIN_PROXY = "https://gh-proxy.com/"
-ALT_PROXY = "https://ghfast.top/"
+# GitHub 加速前缀，顺序即降级顺序（先直连，再按此表逐个试）。
+# 实测（本机 curl，125MB 大文件 + 本项目真实资产，各 3 轮）：
+#   gh.dpik.top      125MB 9~14s / 4~14 MB/s，3/3 成功  —— 最快
+#   v4.gh-proxy.org  125MB 12~18s / 7~10 MB/s，3/3 成功  —— 次之，波动最小
+# ⚠️ 本机直连 github.com 已完全不可用（归档 zip / Release / raw 全部超时），
+#    加速前缀是唯一可用的下载通道，这两项都必须保持有效。
+# 注意 v4.gh-proxy.org 只有带 v4. 前缀的子域可用，裸 gh-proxy.org 基本不通。
+# 已移除 gh-proxy.com / gh-proxy.org：本机连不上或速度≈0（60s 只收到 0.5MB）。
+# 已移除 ghfast.top：对 jxxghp/* 全量 403（Forbidden by black list），本项目不可用。
+# 网页/订阅源型的降级级（releases/latest、releases.atom）对两者都不通：
+# gh.dpik.top 返回 404、v4.gh-proxy.org 返回 403/301；文件型 URL 两者均正常。
+PROXIES = ("https://gh.dpik.top/", "https://v4.gh-proxy.org/")
 
 # 自带 Python 运行时：MoviePilot V3 的 pyproject 要求 requires-python >=3.14，
 # 而 fnOS 应用中心只提供 python312，所以必须自带解释器（官方 Docker 镜像同样自带
@@ -268,7 +278,7 @@ def get_backend_version():
 # 下载（直连 -> 代理降级）
 # ---------------------------------------------------------------------------
 def download(url, out_file, force=False):
-    """下载顺序：直连 -> gh-proxy -> ghfast，任一成功即返回。
+    """下载顺序：直连 -> 各加速前缀（按 PROXIES 顺序），任一成功即返回。
 
     先写 .part 临时文件、成功后原子改名：直接写目标文件时，中途失败的
     残缺文件会在下次构建被"已存在且非空"检查误判为完整产物。
@@ -277,9 +287,9 @@ def download(url, out_file, force=False):
     if out_file.exists() and out_file.stat().st_size > 0 and not force:
         return True
     tmp = out_file.with_name(out_file.name + ".part")
-    urls = [url, f"{MAIN_PROXY}{url}", f"{ALT_PROXY}{url}"]
+    urls = [url] + [f"{p}{url}" for p in PROXIES]
     for i, u in enumerate(urls):
-        tag = "直连" if i == 0 else ("加速(gh-proxy)" if i == 1 else "加速(ghfast)")
+        tag = "直连" if i == 0 else f"加速({PROXIES[i - 1]})"
         log(f"  [{tag}] {u}")
         try:
             req = urllib.request.Request(u, headers={"User-Agent": "MoviePilot-fnOS-build"})
