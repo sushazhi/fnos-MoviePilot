@@ -87,7 +87,7 @@ MoviePilot V3 的 `pyproject.toml` 声明 `requires-python >= 3.14`，而 fnOS �
 │   ├── bin/
 │   │   ├── gateway-proxy.py     # 网关反向代理（核心）
 │   │   ├── supervisor.py        # 唯一主进程，托管后端/前端/代理
-│   │   ├── mp_updater.py        # 上游自更新器（重启即升级，纯标准库）
+│   │   ├── mp_updater.py        # 上游自更新器（重启即升级：主程序 + 站点资源，纯标准库）
 │   │   └── frontend-server.js   # Node 前端服务 + API 代理
 │   ├── mp/                      # MoviePilot V3 源码（build 时下载）
 │   │   └── requirements.lock.txt# 由 uv.lock 导出的锁定依赖清单（在线兜底时用）
@@ -98,7 +98,7 @@ MoviePilot V3 的 `pyproject.toml` 声明 `requires-python >= 3.14`，而 fnOS �
 │       └── images/              # 入口图标
 ├── cmd/                         # 生命周期脚本
 │   ├── lib.sh                   # 公共函数（运行用户/权限收敛/密码校验/运行时解析）
-│   ├── main                     # start / stop / status / update / update-check / rollback
+│   ├── main                     # start / stop / status / update / update-check / resources / rollback
 │   ├── install_init/callback
 │   ├── config_init/callback
 │   ├── upgrade_init/callback
@@ -111,7 +111,8 @@ MoviePilot V3 的 `pyproject.toml` 声明 `requires-python >= 3.14`，而 fnOS �
 ├── build.py                    # 跨平台构建脚本（推荐）
 ├── tools/
 │   ├── bump_upstream.py        # 上游版本检查/升级：改 build.py 的 pin + 同步 manifest（CI 每周跑，本地也可跑）
-│   ├── updater_smoke.py        # 自更新器离线冒烟测试（沙箱，Windows 亦可跑）
+│   ├── bump_upstream_smoke.py  # 上游版本检查/升级的离线冒烟测试（沙箱，不联网；钉住「changelog 只保留最新版本」）
+│   ├── updater_smoke.py        # 自更新器离线冒烟测试（主程序 + 站点资源同步，沙箱，Windows 亦可跑）
 │   ├── resources_smoke.py      # 站点资源修复/回填的离线冒烟测试
 │   ├── supervisor_smoke.py     # 进程托管（失败计数/退避/重启）的离线冒烟测试
 │   ├── cmd_env_smoke.py        # 生命周期脚本 app.env 生成逻辑的离线冒烟测试（需 bash）
@@ -196,11 +197,20 @@ pin 与 `manifest`（`version` + `changelog`）→ 提交 master → 打同名 t
   因此改成显式**派发** `build-and-release.yml`（所以本 workflow 需要 `actions: write`）。
 - **幂等 / 自愈**：提交成功后下次检查读到的 pin 已是最新，直接跳过；万一「提交成功但派发失败」，
   下次运行会发现「tag 在、Release 不在」并自动补派发一次。
-- **强制重打当前版本**：手动跑本 workflow 并勾上 `force`（用于验证流水线）。
+- **`changelog` 只保留最新版本，不做累积**：本仓库的既定口径是 manifest 里始终只有
+  **当前版本这一条**条目（`tools/bump_upstream.py` 的 `MAX_CHANGELOG_ENTRIES = 1`）。
+  changelog 会进包内 manifest 并显示在应用中心，同时又是 Release notes 的来源，越滚越长没有意义；
+  所以每次跟进上游都是**整条替换**，而不是把新条目追加到历史条目后面。
+- **强制重打当前版本**：手动跑本 workflow 并勾上 `force`（用于验证流水线）。此时 `version`
+  已经是目标值，脚本**不会**再动 `changelog`，因此反复重跑也不会往里面塞重复条目。
 - **手动补发某个版本**：跑 `build-and-release.yml`，ref 填对应 tag。
 
 > 本地也可以跑同一套逻辑（不需要 CI）：`python tools/bump_upstream.py --detect` 只看有没有更新，
 > `--apply` 真去改文件；不带 `GITHUB_TOKEN` 时受匿名 API 限流（60 次/小时）。
+>
+> 「只保留最新一条」这条口径由 `tools/bump_upstream_smoke.py` 离线冒烟测试钉住（不联网，
+> 沙箱内造一份含三条历史条目的 manifest，断言改完只剩一条）。改 `MAX_CHANGELOG_ENTRIES`
+> 或去掉「版本未变就不动 changelog」的守卫都会让它失败 —— 这两处一旦被改，累积就会悄悄回来。
 
 ## 安装
 
@@ -238,6 +248,10 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 上游 MoviePilot 发布新版本时**不需要重新构建 fpk**：应用每次启动（含重启）前会
 自动检查上游 Release，有新版本就下载并就地替换后端源码与前端 dist，然后用新代码启动。
 
+**站点资源（站点认证扩展 + 站点索引）走同一条"重启即更新"路径**，但它是**独立的
+发布通道**（`jxxghp/MoviePilot-Resources`，版本号与主程序毫无关系），所以单独检查、
+单独开关、单独冷却。详见下文「站点资源同步」。
+
 ### 为什么不用 MoviePilot 自带的更新功能
 
 上游 V3 确实有 `SystemUpdateManager`（界面里的"检查更新/下载/安装"），但它在 fnOS 上
@@ -252,6 +266,10 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 且"重启后应用已下载包"这一步挂在 CLI 的 `start`/`restart` 里，本应用由 supervisor
 直接 `python app/main.py` 启动，压根不经过 CLI。所以改为自研更新器：
 **下载 Release 压缩包 + 目录级替换**，只依赖标准库，不需要 git / uv。
+
+站点资源那边是同一个道理：上游 `ResourceHelper` 能算出"资源有新版"，但
+`apply_prepared_update()` 同样是 Docker-only，`install_update` 又要 `can_restart()`
+（本包由 supervisor 而非 CLI 启动，恒为 false）。所以资源也由自研更新器直接接管。
 
 ### 工作流程
 
@@ -269,34 +287,83 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 另外：如果 MoviePilot 界面已经下载过更新包（`config/temp/movietpilot-update/`），
 更新器会**直接复用**它，不重复下载。
 
+### 站点资源同步（认证扩展 + 站点索引）
+
+站点资源**不在主程序仓库里**，由 `jxxghp/MoviePilot-Resources` 单独发布，运行时需要
+恰好两个文件（`resources.v3/`，与主程序版本无关）：
+
+| 文件 | 作用 | 上游版本号 |
+|------|------|-----------|
+| `user.sites.v3.bin` | 站点索引（Fernet 密文，含各站点定义） | `3.0.17` |
+| `sites.cpython-<ABI>-<arch>-linux-gnu.so` | 站点认证扩展（Cython 编译的 `SitesHelper`） | `3.0.4` |
+
+工作流程（`mp_updater.py --resources`）：
+
+1. 用后端解释器导入 `app.application.site.sites`，读出**真实的**本地资源版本
+   （读不到才退回状态文件，再退回 `"0"` —— `"0"` 必然小于清单里的任何版本，最坏只是多下一次）
+2. 拉上游 `package.v3.json`，按平台 / ABI 选出本机需要的两个文件，逐项校验清单
+   （必须覆盖本机所需文件、类型已知、平台匹配、`target` 指向约定目录、版本号非空）
+3. 版本有更新 → 从 **raw 文件型 URL** 下载到暂存目录（走加速前缀；不用 `api.github.com`）
+4. 旧文件 rename 进备份 → 安装 → 校验（文件在位 + ABI 名 + 版本号）
+5. 任一步失败：**整批回滚**到旧资源，只记录错误，**不阻塞启动**
+
+四条硬约束，每条背后都有事故：
+
+- **索引与扩展必须成对替换**。索引是密文，其格式由扩展约定；旧索引配新扩展会解出空
+  站点列表 —— 表现是「站点认证」页 `No data available`，而文件一个都不少。所以下载
+  全部成功才动运行目录，绝不出现"扩展换了、索引没换"的中间态。
+- **只装 ABI 匹配的扩展**。ABI 标签取自后端解释器（`cp314` / 自由线程构建是 `cp314t`），
+  不符是 `ImportError`，后端直接起不来。上游同时分发 `cp311`–`cp314t` 各平台版本，
+  按 ABI 选错一个就废。
+- **只认 `RESOURCE_FLAG` 这一代（v3）**。上游同时分发 `resources.v2` / `resources.v3`，
+  装错一代同样解不开索引。
+- **失败绝不阻塞启动**。资源旧一点只是站点少；起不来是全站不可用。因此调用点写的是
+  `run_updater --resources --auto || true`，且退出码 `11` 被当作"成功"处理。
+
+> 版本比较**不信状态文件**。fpk 重装会把 `app/` 换回打包时的资源，而
+> `CONFIG_DIR/mp_update.json` 是持久化的 —— 只信状态文件的话，重装后那个"更高的版本号"
+> 会让检查永远判定"已最新"，站点资源再也升不上去。所以以真实探测为准。
+
+> 资源备份在 `<应用目录>/.mp-res-backup/`，与主程序备份 `.mp-backup/` **同级而非嵌套**：
+> 若嵌在里面，`--rollback`（按目录名取最近一次）会把只含两个资源文件的目录当成主程序
+> 备份去恢复。
+
 ### 开关（`app.env`，也可在应用设置里切换）
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `MP_AUTO_UPDATE` | `1` | 总开关，应用设置里有下拉可选 |
+| `MP_AUTO_UPDATE` | `1` | 主程序自更新总开关，应用设置里有下拉可选 |
 | `MP_UPDATE_CHANNEL` | `release` | `release` 仅正式版 / `prerelease` 含测试版 / `off` 关闭 |
-| `MP_UPDATE_INTERVAL` | `21600` | 检查间隔（秒），避免每次重启都查 GitHub |
+| `MP_UPDATE_INTERVAL` | `21600` | 检查间隔（秒），避免每次重启都查 GitHub；**站点资源共用此间隔，各记各的时间戳** |
 | `MP_UPDATE_DEPS` | `1` | 是否同步 Python 依赖；关闭且新版本有新增依赖时会**拒绝更新**（避免装出起不来的版本） |
+| `MP_AUTO_UPDATE_RESOURCE` | `1` | 是否同步站点资源（认证扩展 + 索引），应用设置里有下拉可选 |
 | `GITHUB_PROXY` | `https://gh-proxy.com/` | 加速前缀，**只作用于 `github.com` 系 URL**（归档下载、网页兜底版本发现）；`api.github.com` 一律直连，不受它影响 |
 | `GITHUB_PROXY_MIRRORS` | 空 | 额外加速前缀，逗号分隔（如 `https://a/,https://b/`）。内置镜像失效时可不动代码换一批 |
 
 > 版本发现失败时不占用整个检查间隔：只冷却 15 分钟就重试（网络抖动不该让自动更新停摆半天）。
 > 四级降级带时间预算（API 直连 15s、单次请求 10s、整体 120s），所以更新检查不会把启动拖成几分钟。
+> 站点资源同理，且同一版本连续失败 2 次后跳过（`--force` 可强制重试）。
 
 ### 手动操作与回退
 
 ```bash
-# 立即检查并更新（忽略冷却）；应用运行中会先停后启
+# 立即检查并更新主程序（忽略冷却）；应用运行中会先停后启
 /var/apps/moviepilot/target/cmd/main update
-# 只看有没有新版本，不动任何文件
+# 只看有没有新版本，不动任何文件（主程序 + 站点资源）
 /var/apps/moviepilot/target/cmd/main update-check
+# 立即同步站点资源（认证扩展 + 站点索引），忽略冷却
+/var/apps/moviepilot/target/cmd/main resources
 # 回滚到更新前的版本（备份在 <应用目录>/.mp-backup/）
 /var/apps/moviepilot/target/cmd/main rollback
-# 修复站点资源（sites 模块错位/缺失导致后端起不来时）
+# 修复站点资源（sites 模块错位/缺失导致后端起不来时，纯本地、无网络）
 /var/apps/moviepilot/target/cmd/main repair
 ```
 
 更新日志：`TRIM_PKGVAR/update.log`；状态文件：`TRIM_PKGVAR/config/mp_update.json`。
+
+> `repair` 与 `resources` 的分工：`repair` 是**离线自愈**（把资源文件按当前源码结构
+> 重新对位，无网络、无版本比较，只保证"在正确的位置且能加载"）；`resources` 是**在线
+> 升级**（比对上游版本并下载新版）。启动路径两个都会跑：先 `repair` 再 `resources`。
 
 > 注意：通过 fpk 重新安装/升级应用时，应用目录会被整包替换，自更新的内容随之回到
 > 安装包自带的版本（这是预期行为，也让"应用包升级"始终是可靠的回退路径）。
@@ -310,6 +377,7 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 - 产物体积较大（自带解释器 + 全部依赖），预期在数百 MB 量级；这是「安装时零联网」的代价
 - MoviePilot 的插件依赖是在运行时用自身解释器的 pip 安装到 `app/python/` 的 `site-packages`。**升级会整包替换应用目录，插件依赖需要重新安装**
 - 自更新只替换后端源码与前端静态文件，不替换自带 Python 运行时（`app/python/`）；新版本引入新依赖时由更新器用 pip 增量补装（需要联网，走国内镜像）
+- 站点资源同步只替换站点认证扩展与站点索引两个文件（都在 `app/application/site/`），**不动** `site-packages`，因此更新成功后无需像主程序那样修正运行时权限
 - 自更新要求应用目录可写（`TRIM_APPDEST`）。目录只读时会跳过更新并记日志，此时只能通过重新安装应用包升级
 - 默认使用 **SQLite**；如需 PostgreSQL，可在 `app.env` 中设置 `DB_TYPE=postgresql` 并配置连接（需 fnOS 安装 PostgreSQL）
 - **版本号已改为上游派生**：`manifest` 的 `version` 与上游 tag 逐字对应（去前导 `v`），例如上游 `v3.0.10-1` → 本包 `3.0.10-1`。因此 git tag 从旧的 `v1.0.x` 系列跳到 `v3.0.10-1`，不再有本地构建计数器 —— 「换了哪份上游」一眼可见，也便于与上游 Release 对照

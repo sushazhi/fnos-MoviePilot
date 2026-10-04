@@ -131,7 +131,7 @@ is_running() {
 # 更新器内部已回滚，这里只记录退出码。
 #   --auto  ：遵守 app.env 的 MP_AUTO_UPDATE 开关与检查冷却（启动路径用）
 #   --force ：忽略开关与冷却（手动 update 子命令用）
-# 退出码：0 无需更新 / 10 已更新 / 124 超时 / 其它 失败
+# 退出码：0 无需更新 / 10 主程序已更新 / 11 站点资源已更新 / 124 超时 / 其它 失败
 run_updater() {
     [ -f "$MP_UPDATER" ] || { log "跳过更新检查：缺少 ${MP_UPDATER}"; return 0; }
     [ -x "$APP_PYTHON" ] || { log "跳过更新检查：Python 运行时不存在（${APP_PYTHON}）"; return 0; }
@@ -150,7 +150,8 @@ run_updater() {
     fi
     # 更新器自己的日志已经由它写进 UPDATE_LOG（MP_UPDATE_LOG）；这里只把 stdio 里
     # 它没覆盖到的部分（traceback、timeout 提示）补进去，排障线索不丢也不重复。
-    if [ -s "$UPDATE_STDIO_LOG" ] && [ "$rc" != "0" ] && [ "$rc" != "10" ]; then
+    # 11 与 10 一样算"成功"，不补 stdio。
+    if [ -s "$UPDATE_STDIO_LOG" ] && [ "$rc" != "0" ] && [ "$rc" != "10" ] && [ "$rc" != "11" ]; then
         {
             echo "$(date '+%Y-%m-%d %H:%M:%S') - [cmd/main] 更新器 stdio 末尾（rc=$rc）"
             tail -n 20 "$UPDATE_STDIO_LOG"
@@ -166,6 +167,7 @@ run_updater() {
              fi
              ;;
         124) log "==> 更新检查超时（${MP_UPDATE_TIMEOUT:-600}s），继续使用当前版本" ;;
+        11)  log "==> 已更新站点资源（认证扩展 + 站点索引）" ;;
         *)   log "==> 更新检查未完成（rc=$rc），继续使用当前版本" ;;
     esac
     return $rc
@@ -279,6 +281,14 @@ start)
     fi
     # 更新器会替换整个 app/，资源回填有可能落在旧目录，启动前统一对位一次
     repair_resources
+    # 站点资源（认证扩展 sites.* + 站点索引 user.sites.v3.bin）由独立仓库发布，
+    # 与主程序版本无关：主程序没有新版时它同样可能有新版。所以单独走一次检查。
+    # 顺序放在 repair_resources 之后：先确保资源在**新版代码认的目录**里，再谈升版本。
+    # 与主程序更新一样，失败只记日志，绝不阻塞启动（资源旧一点只是站点少，
+    # 起不来是全站不可用）。
+    if [ "${MP_SKIP_UPDATE:-}" != "1" ]; then
+        run_updater --resources --auto || true
+    fi
     start_app || exit 1
     log "=== started ==="
     exit 0
@@ -293,6 +303,8 @@ update)
         sleep 2
     fi
     run_updater --force || true
+    # 主程序更新可能顺带换了资源目录结构，这里补一次资源同步（--force 忽略冷却）
+    run_updater --resources --force || true
     tail -n 30 "$UPDATE_LOG" > "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
     if [ "$was_running" = "1" ]; then
         "$0" start
@@ -303,7 +315,24 @@ update-check)
     # 只检查不更新，结果写入 update.log 与临时日志文件
     log "=== 更新检查 ==="
     run_updater --check --force || true
+    run_updater --resources --check --force || true
     tail -n 30 "$UPDATE_LOG" > "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+    exit 0
+    ;;
+resources)
+    # 手动立即同步站点资源（认证扩展 + 站点索引），忽略冷却
+    log "=== 同步站点资源 ==="
+    was_running=0
+    if is_running; then
+        was_running=1
+        "$0" stop
+        sleep 2
+    fi
+    run_updater --resources --force || true
+    tail -n 30 "$UPDATE_LOG" > "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+    if [ "$was_running" = "1" ]; then
+        "$0" start
+    fi
     exit 0
     ;;
 repair)
@@ -347,7 +376,7 @@ status)
     exit 3
     ;;
 *)
-    echo "Usage: $0 {start|stop|restart|status|update|update-check|rollback|repair}" > "$TRIM_TEMP_LOGFILE"
+    echo "Usage: $0 {start|stop|restart|status|update|update-check|resources|rollback|repair}" > "$TRIM_TEMP_LOGFILE"
     exit 1
     ;;
 esac

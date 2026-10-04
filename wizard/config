@@ -27,6 +27,16 @@
           { "label": "开启（推荐）", "value": "1" },
           { "label": "关闭", "value": "0" }
         ]
+      },
+      {
+        "type": "select",
+        "field": "wizard_auto_update_resource",
+        "label": "站点资源同步（应用重启时同步站点认证扩展与站点索引，失败自动回滚不影响启动）",
+        "initValue": "1",
+        "options": [
+          { "label": "开启（推荐）", "value": "1" },
+          { "label": "关闭", "value": "0" }
+        ]
       }
     ]
   },

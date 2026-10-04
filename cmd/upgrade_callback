@@ -62,6 +62,7 @@ mp_env_ensure "${CONFIG_DIR}/app.env" "MP_AUTO_UPDATE" "1"
 mp_env_ensure "${CONFIG_DIR}/app.env" "MP_UPDATE_CHANNEL" "release"
 mp_env_ensure "${CONFIG_DIR}/app.env" "MP_UPDATE_INTERVAL" "21600"
 mp_env_ensure "${CONFIG_DIR}/app.env" "MP_UPDATE_DEPS" "1"
+mp_env_ensure "${CONFIG_DIR}/app.env" "MP_AUTO_UPDATE_RESOURCE" "1"
 
 # 补齐安全密钥（老版本安装的 app.env 没有这两个键）。
 # 缺失时 MoviePilot 回退到 `secrets.token_urlsafe(32)` 的**每次启动随机**默认值，

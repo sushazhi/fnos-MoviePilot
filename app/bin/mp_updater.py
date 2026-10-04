@@ -14,7 +14,7 @@ MoviePilot fnOS 应用自更新器（重启即升级）
   解包出来的普通目录（没有 .git），NAS 上也不一定有 git/uv，所以这条路走不通。
   这里改为"下载 Release 压缩包 + 目录级替换"，只依赖标准库。
 
-流程：
+流程（默认 / --auto / --force，同步主程序）：
   1. 读本地版本（mp/version.py 的 APP_VERSION）与状态文件（冷却/失败计数）
   2. 查 GitHub Release（release=仅正式版 / prerelease=含测试版）
      四级降级：API（只直连）→ 网页 latest → releases.atom → 分支 version.py
@@ -27,9 +27,19 @@ MoviePilot fnOS 应用自更新器（重启即升级）
   7. 自检（依赖 import + 语法编译），失败则整树回滚到备份
   8. 更新状态文件
 
+流程（--resources，同步站点资源：认证扩展 + 站点索引）：
+  1. 用后端解释器导入 app.application.site.sites，读出真实的本地资源版本
+     （读不到才退回状态文件，再退回 "0" —— 见 probe_local_resource_versions）
+  2. 拉上游 package.v3.json，按平台/ABI 选出本机需要的两个文件
+  3. 版本有更新 → 从 raw 文件型 URL 下载到暂存目录（走加速前缀）
+  4. 旧文件 rename 进备份 → 安装 → 校验（文件在位 + ABI 名 + 版本号）
+  5. 任一步失败：整批回滚到旧资源，只记录错误，不阻塞启动
+  站点资源是**独立发布通道**，与主程序版本无关，所以单独走一个开关与冷却。
+
 退出码（cmd/main 依此决定后续动作）：
   0  无需更新 / 已是最新 / 跳过
-  10 更新成功（需要修正运行时权限）
+  10 主程序更新成功（需要修正运行时权限）
+  11 站点资源更新成功（不动 site-packages，无需修权限）
   1  更新失败（已回滚，继续用当前版本启动）
   2  环境或用法错误
 
@@ -44,6 +54,8 @@ MoviePilot fnOS 应用自更新器（重启即升级）
   MP_UPDATE_CHANNEL   release|prerelease|off（默认 release）
   MP_UPDATE_INTERVAL  检查间隔秒（默认 21600）
   MP_UPDATE_DEPS      1/0      是否同步 Python 依赖（默认 1）
+  MP_AUTO_UPDATE_RESOURCE 1/0  是否同步站点资源（认证扩展+索引，默认 1）
+  MP_UPDATE_INTERVAL  同时用作站点资源的检查间隔（各记各的时间戳）
   GITHUB_PROXY        加速前缀，用于 github.com 系 URL（app.env 里已配）
   GITHUB_PROXY_MIRRORS 额外加速前缀，逗号分隔（本更新器专用，见 Config.proxies）
 
@@ -62,6 +74,7 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 import time
 import urllib.request
 import zipfile
@@ -148,6 +161,22 @@ RESOURCE_SUBDIRS = (
 # 显示 No data available，而文件看起来都在。
 RESOURCE_FLAG = "v3"
 
+# 站点资源仓库（认证扩展 sites.* 与站点索引 user.sites.*.bin 的发布地）。
+# 它与主程序仓库是两条**独立**的发布通道：主程序发新版本不代表资源变了，
+# 资源变了也不代表主程序有新版本。所以资源的版本比较只看资源清单里的 version
+# 字段，绝不能用 APP_VERSION 代替（否则要么漏更新，要么每次重启都白下一遍）。
+RESOURCES_REPO = "jxxghp/MoviePilot-Resources"
+RESOURCES_BRANCH = "main"
+RESOURCES_MANIFEST = ("https://raw.githubusercontent.com/{repo}/{branch}/"
+                      "package.{flag}.json")
+# 资源文件走 raw 文件型 URL：镜像普遍转发它，而且完全避开 api.github.com
+# （该域名在受限网络里最不可靠，上游的下载实现正是卡在这里）。
+RESOURCES_RAW = ("https://raw.githubusercontent.com/{repo}/{branch}/"
+                 "resources.{flag}/{name}")
+# 资源清单 target 字段必须等于这个相对路径。由 RESOURCE_SUBDIRS 派生而不是
+# 写死字面量，避免目录约定变更时两处漂移。
+RESOURCE_TARGET = Path("app").joinpath(*RESOURCE_SUBDIRS[0])
+
 # 只认 v3.x.y（可带上游的重新打包序号 `-N`，或 alpha/beta/rc 后缀）：上游仓库
 # 同时存在 v1/v2 历史 tag 与 dev 之类非版本引用，一律不接受，避免"升级"到旧版本
 # 或不明引用。
@@ -162,6 +191,9 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
 EXIT_UPDATED = 10
+# 站点资源已更新。与 10 分开是因为后续动作不同：资源替换不动 site-packages，
+# 不需要 cmd/main 再去修运行时权限。
+EXIT_RESOURCE_UPDATED = 11
 
 MAX_FAILURES = 2          # 同一版本连续失败次数上限，超过就跳过（避免每次重启都重下一遍坏包）
 KEEP_BACKUPS = 2          # 保留的备份代数
@@ -227,6 +259,12 @@ class Config:
         # 备份根目录放在 mp 的同级（${TRIM_APPDEST}/.mp-backup），与 mp 同一文件系统，
         # 备份用 rename 完成，瞬间且不需要额外空间复制
         self.backup_root = self.mp_src.parent / ".mp-backup" if self.mp_src else Path()
+        # 站点资源单独一层备份：它与主程序是两条发布通道，混在同一个备份目录里
+        # 会让 `--rollback`（按目录名取最近一次）有可能把资源备份当成主程序备份
+        # 去恢复，进而把整个 app/ 换成一个只含两个资源文件的目录。所以是**同级
+        # 兄弟目录**，不是 backup_root 的子目录。
+        self.resource_backup_root = (self.mp_src.parent / ".mp-res-backup"
+                                     if self.mp_src else Path())
 
     def get(self, key: str, default: str = "") -> str:
         """环境变量优先，其次 app.env。"""
@@ -1059,6 +1097,345 @@ def verify_site_resources(mp_src: Path) -> None:
             f"站点资源目录缺少本机可用的 sites 扩展（需要 {' / '.join(wanted)}）: {res_dir}")
 
 
+# ---------------------------------------------------------------------------
+# 站点资源同步（认证扩展 + 站点索引，与主程序互为独立发布通道）
+# ---------------------------------------------------------------------------
+# 站点资源不在主程序仓库里：认证扩展（sites.cpython-*.so / sites.cp*.pyd）与站点
+# 索引（user.sites.v3.bin）由 jxxghp/MoviePilot-Resources 单独发布，版本号与
+# APP_VERSION 毫无关系。上游自己有一条资源更新链路，但在本打包里走不通：
+# 下载完的 apply_prepared_update() 要求 Docker 环境，内建重启要求进程由 CLI 启动，
+# 而 supervisor.py 是直接跑 app/main.py 的（两条都不满足），于是"重启即更新"
+# 只剩主程序这一半。这里补上资源这一半。
+#
+# 四条硬约束，每条背后都有事故：
+#   * 索引与扩展必须**成对**替换。索引是 Fernet 密文，其格式与解密口径由扩展约定，
+#     旧索引配新扩展会解出空站点列表 —— 表现是"站点认证"页 No data available，
+#     而文件看起来一个都不少。
+#   * 只装与当前解释器 ABI 匹配的扩展（cpython-314 / cpython-314t / cp314-win_amd64），
+#     ABI 不符是 ImportError，后端直接起不来。
+#   * 只认 RESOURCE_FLAG 这一代（v3）：上游同时分发 v2/v3，装错一代同样解不开。
+#   * 失败必须整批回滚，并且**绝不阻塞启动**：资源旧一点只是站点少，起不来是全站不可用。
+def resource_platform() -> str:
+    """返回资源清单 platform 字段用的平台名（与上游 SystemUtils.platform() 同口径）。"""
+    if os.name == "nt":
+        return "Windows"
+    if sys.platform == "darwin":
+        return "MacOS"
+    if resource_machine_tag() == "aarch64":
+        return "Arm64"
+    return "Linux"
+
+
+def resource_machine_tag() -> str:
+    """把 platform.machine() 归一成资源文件名里的架构标签。"""
+    machine = platform.machine().lower()
+    if machine in ("arm64", "aarch64"):
+        return "aarch64"
+    if machine in ("x86_64", "amd64"):
+        return "x86_64"
+    return machine
+
+
+def resource_python_tag() -> str:
+    """当前解释器的 CPython ABI 标签（如 cp314 / cp314t）。
+
+    自由线程（free-threaded）构建的资源名带 `t`，普通构建不带，两者 ABI 不兼容。
+    判据取自 sysconfig 而不是猜：本脚本由 $APP_PYTHON 启动，也就是后端真正用的
+    那个解释器，所以这里的标签与后端运行期完全一致。
+    """
+    tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    if sysconfig.get_config_var("Py_GIL_DISABLED"):
+        tag += "t"
+    return tag
+
+
+def needed_resource_files() -> list:
+    """本机需要的资源文件名（与上游 ResourceHelper._get_needed_files 同口径）。
+
+    返回 [索引, 认证扩展]，顺序有意义：上游用 files[0] 取索引版本、files[-1] 取认证
+    版本，保持一致可以让日志与上游逐字对照。
+    """
+    tag = resource_python_tag()
+    ver = tag.replace("cp", "")
+    index = f"user.sites.{RESOURCE_FLAG}.bin"
+    if os.name == "nt":
+        return [index, f"sites.cp{ver}-win_amd64.pyd"]
+    if sys.platform == "darwin":
+        return [index, f"sites.cpython-{ver}-darwin.so"]
+    return [index, f"sites.cpython-{ver}-{resource_machine_tag()}-linux-gnu.so"]
+
+
+# 版本探测脚本：把两个版本号塞在一行带哨兵前缀的 JSON 里，避免被扩展在 import
+# 期打出的任何日志污染。用哨兵行而不是"取最后一行"，是因为 sites 扩展加载时
+# 可能输出告警。
+_RESOURCE_PROBE = (
+    "import json\n"
+    "from app.application.site.sites import SitesHelper\n"
+    "print('__MP_RESOURCE_VERSIONS__' + json.dumps("
+    "[str(SitesHelper().auth_version), str(SitesHelper().indexer_version)]))\n"
+)
+_RESOURCE_PROBE_MARK = "__MP_RESOURCE_VERSIONS__"
+
+
+def probe_local_resource_versions(cfg: Config):
+    """用后端解释器读出本机**实际加载**的资源版本；读不到返回 None。
+
+    为什么不直接信状态文件：fpk 重装会把 app/ 换回打包时的资源，而
+    CONFIG_DIR/mp_update.json 是持久化的。只信状态文件的话，重装后状态里那个
+    "更高的版本号"会让检查永远判定"已最新"，站点资源再也升不上去。
+    探测失败才退回状态文件，再退回 "0" —— "0" 必然小于清单里的任何版本，
+    最坏情况只是多下一次，不会漏更新。
+
+    探测机制与 mp_resources.native_loadable 一致：真实解释器 + cwd=MP_SRC +
+    PYTHONPATH=MP_SRC。sites 扩展在 import 期就要读 app.runtime 的配置，缺了
+    这些路径必然失败，用桩模块是测不出来的。
+    """
+    if not cfg.python:
+        return None
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(cfg.mp_src)
+    env.setdefault("MP_SRC", str(cfg.mp_src))
+    if cfg.config_dir:
+        env.setdefault("CONFIG_DIR", str(cfg.config_dir))
+    try:
+        proc = subprocess.run([cfg.python, "-c", _RESOURCE_PROBE],
+                              cwd=str(cfg.mp_src), env=env, timeout=60,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True)
+    except Exception as e:  # noqa: BLE001 - 探测失败不是错误，只是没有权威版本
+        log(f"    站点资源版本探测失败: {e}")
+        return None
+    for line in (proc.stdout or "").splitlines():
+        if not line.startswith(_RESOURCE_PROBE_MARK):
+            continue
+        try:
+            auth, indexer = json.loads(line[len(_RESOURCE_PROBE_MARK):])
+        except (ValueError, TypeError):
+            continue
+        return str(auth or "0"), str(indexer or "0")
+    log(f"    站点资源版本探测无结果（rc={proc.returncode}），改用状态文件")
+    return None
+
+
+def resource_update_info(cfg: Config, local_versions: dict) -> dict:
+    """读取上游资源清单，返回本机所需文件的版本信息（含是否需更新）。
+
+    校验口径与上游 ResourceHelper.get_update_info 完全一致：清单必须覆盖本机所需
+    文件、类型已知、平台匹配、target 指向约定目录、版本号非空。宁可整批拒绝，
+    也不做"部分匹配"式的半装 —— 索引与扩展必须成对。
+
+    返回 {"package_version", "files", "changed", "latest", "up_to_date"}。
+    """
+    url = RESOURCES_MANIFEST.format(repo=RESOURCES_REPO, branch=RESOURCES_BRANCH,
+                                    flag=RESOURCE_FLAG)
+    _, text = fetch_text(url, cfg.proxies, timeout=DISCOVERY_TIMEOUT)
+    if not text:
+        raise UpdateError("无法连接资源包仓库")
+    try:
+        info = json.loads(text)
+    except ValueError as e:
+        raise UpdateError("资源包仓库数据解析失败") from e
+    if not isinstance(info, dict):
+        raise UpdateError("资源包仓库数据格式异常")
+    resources = info.get("resources") or {}
+    platform_name = resource_platform()
+    needed = needed_resource_files()
+    selected = {}
+    changed = set()
+    for name in needed:
+        item = resources.get(name)
+        if not isinstance(item, dict):
+            raise UpdateError(f"资源包清单缺少当前平台文件：{name}")
+        kind = item.get("type")
+        kind = "indexer" if kind == "sites" else kind
+        if kind not in ("auth", "indexer"):
+            raise UpdateError(f"资源包清单包含未知资源类型：{name}")
+        declared = item.get("platform")
+        if declared and declared != platform_name:
+            raise UpdateError(f"资源包平台不匹配：{name}")
+        if Path(str(item.get("target") or "")) != RESOURCE_TARGET:
+            raise UpdateError(f"资源包目标目录不安全：{name}")
+        version = str(item.get("version") or "").strip()
+        if not version:
+            raise UpdateError(f"资源包清单缺少版本号：{name}")
+        if version_key(version) > version_key(str(local_versions.get(kind) or "0")):
+            changed.add(kind)
+        selected[name] = {"name": name, "type": kind, "version": version}
+    files = [selected[name] for name in needed]
+    latest = {item["type"]: item["version"] for item in files}
+    if not changed:
+        log(f"    站点资源已最新（认证 {latest.get('auth')} / 索引 {latest.get('indexer')}）")
+    return {
+        "package_version": str(info.get("version") or ""),
+        "files": files,
+        "changed": sorted(changed),
+        "latest": latest,
+        "up_to_date": not changed,
+    }
+
+
+def install_resource_files(cfg: Config, files: list, work: Path,
+                           backup_dir: Path, moves: list) -> None:
+    """下载并安装站点资源；回滚信息**追加**进调用方的 moves。
+
+    下载先落到暂存目录，全部成功后才动运行目录：只要有一个文件拿不到就整体放弃，
+    不会出现"扩展换了、索引没换"的中间态（那正是解不开索引的形态）。
+
+    moves 由调用方传入而不是返回：安装是逐个文件进行的，第二个文件复制失败时第一个
+    已经替换完毕，若等函数返回才拿到回滚清单，这次替换就漏在回滚之外了。
+    边装边登记，才能保证任何中途失败都回滚得干净。
+    """
+    res_dir = resolve_resource_dir(cfg.mp_src, create=True)
+    staged = work / "resources"
+    staged.mkdir(parents=True, exist_ok=True)
+    for item in files:
+        name = item["name"]
+        log(f"==> 下载站点资源 {name}（{item['version']}）")
+        url = RESOURCES_RAW.format(repo=RESOURCES_REPO, branch=RESOURCES_BRANCH,
+                                   flag=RESOURCE_FLAG, name=name)
+        if not download_file(url, staged / name, cfg.proxies):
+            raise UpdateError(f"站点资源下载失败：{name}")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    for item in files:
+        name = item["name"]
+        dst = res_dir / name
+        saved = None
+        if dst.exists():
+            saved = backup_dir / name
+            dst.replace(saved)
+        moves.append((dst, saved))
+        shutil.copy2(str(staged / name), str(dst))
+        log(f"    安装 {name}")
+
+
+def rollback_resources(moves: list) -> None:
+    """还原 install_resource_files 的改动：旧文件搬回，新装的删掉。"""
+    for dst, saved in moves:
+        try:
+            if saved is not None and saved.exists():
+                if dst.exists():
+                    dst.unlink()
+                shutil.move(str(saved), str(dst))
+            elif dst.exists():
+                dst.unlink()
+        except OSError as e:
+            log(f"    回滚失败 {dst}: {e}")
+
+
+def resource_versions_now(cfg: Config, state: dict) -> dict:
+    """当前站点资源版本：优先真实探测，其次状态文件记录。"""
+    probed = probe_local_resource_versions(cfg)
+    if probed:
+        log(f"    本机站点资源版本：认证 {probed[0]} / 索引 {probed[1]}")
+        return {"auth": probed[0], "indexer": probed[1]}
+    recorded = dict(state.get("resource_versions") or {})
+    log(f"    使用状态文件记录的站点资源版本：{recorded or '未知'}")
+    return recorded
+
+
+def do_resources(cfg: Config, args) -> int:
+    """同步站点资源（认证扩展 + 站点索引）。"""
+    force = bool(getattr(args, "force", False))
+    if not cfg.get_bool("MP_AUTO_UPDATE_RESOURCE", True) and not force:
+        log("站点资源同步已关闭（MP_AUTO_UPDATE_RESOURCE=0）")
+        return EXIT_OK
+    state = load_state(cfg)
+    interval = max(cfg.get_int("MP_UPDATE_INTERVAL", 21600), 0)
+    now = time.time()
+    if not force and interval > 0:
+        last = float(state.get("resource_checked_at") or 0)
+        if now - last < interval:
+            log(f"站点资源检查冷却中（{int((interval - (now - last)) / 60)} 分钟后重试）")
+            return EXIT_OK
+
+    local = resource_versions_now(cfg, state)
+    try:
+        info = resource_update_info(cfg, local)
+    except UpdateError as e:
+        # 失败也记检查时间，但把冷却缩短到 RETRY_AFTER_FAILURE：网络抖动不该让
+        # 资源检查停摆一整个周期（与主程序路径同口径）。
+        state.update({"resource_checked_at": now - max(interval - RETRY_AFTER_FAILURE, 0),
+                      "resource_last_error": str(e)})
+        save_state(cfg, state)
+        raise
+    if info["up_to_date"]:
+        state.update({"resource_checked_at": now, "resource_last_error": None})
+        save_state(cfg, state)
+        return EXIT_OK
+
+    key = str(info.get("package_version") or "")
+    if not force and int((state.get("resource_failures") or {}).get(key, 0)) >= MAX_FAILURES:
+        log(f"站点资源 {key} 连续失败 {MAX_FAILURES} 次，跳过本次（--force 可强制重试）")
+        return EXIT_OK
+
+    label = " / ".join(f"{i['type']}={i['version']}" for i in info["files"])
+    log(f"==> 发现站点资源更新：{label}")
+    work = cfg.tmp_dir / "mp-resource-update"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    backup_dir = cfg.resource_backup_root / time.strftime("%Y%m%d-%H%M%S")
+    moves = []
+    verified = None
+    try:
+        install_resource_files(cfg, info["files"], work, backup_dir, moves)
+        # 安装后必须在回滚窗口内确认"真的生效"，只看文件在位是不够的：
+        # 扩展与索引不匹配时文件同样齐全，但站点列表是空的。
+        verify_site_resources(cfg.mp_src)
+        verified = probe_local_resource_versions(cfg)
+        if local and not verified:
+            raise UpdateError("站点资源安装后无法加载（认证扩展不可导入）")
+        if verified:
+            for kind, got in (("auth", verified[0]), ("indexer", verified[1])):
+                want = info["latest"].get(kind)
+                if want and version_key(got) < version_key(want):
+                    raise UpdateError(
+                        f"站点资源安装后版本不符：{kind} 期望 {want}，实际 {got}")
+    except Exception as e:  # noqa: BLE001 - 任何异常都要整批回滚
+        log(f"错误: 站点资源更新失败: {e}")
+        rollback_resources(moves)
+        failures = state.get("resource_failures") or {}
+        failures[key] = int(failures.get(key, 0)) + 1
+        state.update({"resource_failures": failures, "resource_last_error": str(e),
+                      "resource_checked_at": now})
+        save_state(cfg, state)
+        return EXIT_FAILED
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    applied = dict(state.get("resource_versions") or {})
+    if verified:
+        applied.update({"auth": verified[0], "indexer": verified[1]})
+    else:
+        applied.update(info["latest"])
+    state.update({"resource_versions": applied, "resource_checked_at": now,
+                  "resource_last_error": None, "resource_failures": {}})
+    save_state(cfg, state)
+    prune_backups(cfg.resource_backup_root)
+    log(f"==> 站点资源更新完成：{label}")
+    log(f"    备份保留在 {backup_dir}")
+    return EXIT_RESOURCE_UPDATED
+
+
+def check_resources(cfg: Config) -> dict:
+    """站点资源检查结果（--check --resources 用），只读不改。"""
+    state = load_state(cfg)
+    result = {
+        "enabled": cfg.get_bool("MP_AUTO_UPDATE_RESOURCE", True),
+        "local": None,
+        "latest": None,
+        "update_available": None,
+        "last_error": state.get("resource_last_error"),
+    }
+    try:
+        result["local"] = resource_versions_now(cfg, state)
+        info = resource_update_info(cfg, result["local"])
+        result["latest"] = info["latest"]
+        result["update_available"] = not info["up_to_date"]
+    except UpdateError as e:
+        result["last_error"] = str(e)
+    return result
+
+
 def replace_frontend(staged: Path, frontend_dir: Path, backup_root: Path) -> bool:
     """整体替换前端 dist。staged 里若是 dist/ 子目录则自动提升一层。"""
     inner = staged / "dist"
@@ -1516,6 +1893,11 @@ def main() -> int:
     parser.add_argument("--rollback", action="store_true", help="回滚到最近一次更新前的备份")
     parser.add_argument("--force", action="store_true",
                         help="忽略 MP_AUTO_UPDATE 开关与检查冷却（手动更新用）")
+    # --resources 把动作从"主程序"切到"站点资源"（认证扩展 + 站点索引）。两条通道
+    # 独立发布，所以做成开关而不是叠加在主程序更新里：主程序没新版但资源有新版时，
+    # 也必须能把资源升上去（这正是原来缺失的一半）。
+    parser.add_argument("--resources", action="store_true",
+                        help="改为同步站点资源（认证扩展 + 站点索引），不动主程序")
     # --auto 是"遵守 MP_AUTO_UPDATE 开关与检查冷却"的**默认行为**，本身不做任何事。
     # 但必须显式声明：cmd/main 的启动路径调用的是 `mp_updater --auto`，缺了它
     # argparse 会在解析阶段直接 SystemExit(2)，do_update() 根本没机会执行，于是
@@ -1534,6 +1916,11 @@ def main() -> int:
         return EXIT_USAGE
 
     try:
+        if args.resources:
+            if args.check:
+                print(json.dumps(check_resources(cfg), ensure_ascii=False, indent=2))
+                return EXIT_OK
+            return do_resources(cfg, args)
         if args.check:
             return do_check(cfg)
         if args.rollback:

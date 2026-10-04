@@ -248,6 +248,8 @@ mp_env_bootstrap() {
         mp_env_ensure "${env_file}" "MP_UPDATE_CHANNEL" "release"
         mp_env_ensure "${env_file}" "MP_UPDATE_INTERVAL" "21600"
         mp_env_ensure "${env_file}" "MP_UPDATE_DEPS" "1"
+        # 站点资源（认证扩展 + 站点索引）是独立发布通道，默认同样跟着重启同步。
+        mp_env_ensure "${env_file}" "MP_AUTO_UPDATE_RESOURCE" "1"
         # 只有向导里真的填了才覆盖：留空表示"沿用原有配置"，
         # 早期实现会把留空的管理员密码直接写成空值（等于清掉配置）。
         if [ -n "${wizard_port:-}" ]; then
@@ -295,6 +297,10 @@ MP_UPDATE_CHANNEL=release
 MP_UPDATE_INTERVAL=21600
 # 是否顺带同步 Python 依赖：新版本引入新依赖时必须开启
 MP_UPDATE_DEPS=1
+# 站点资源同步：认证扩展（sites.*）与站点索引（user.sites.v3.bin）由
+# jxxghp/MoviePilot-Resources 独立发布，与主程序版本无关；开启后每次启动前
+# 一并检查。索引与扩展必须成对替换，失败会自动回滚且不影响启动。
+MP_AUTO_UPDATE_RESOURCE=1
 EOF
     echo "fresh"
     return 0

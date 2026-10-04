@@ -79,6 +79,9 @@ expect_eq "A5 RESOURCE_SECRET_KEY 为 44 字符" "44" \
 expect_eq "A6 CONFIG_DIR 写入模板值" "/vol1/@appdata/moviepilot/config" \
     "$(key_value "${ENV_A}" CONFIG_DIR)"
 expect_eq "A7 向导密码写入" "Adm1n@2026" "$(key_value "${ENV_A}" SUPERUSER_PASSWORD)"
+# A8：全新安装的模板里必须带上站点资源同步开关（默认开启）
+expect_eq "A8 模板含站点资源同步开关" "1" \
+    "$(key_value "${ENV_A}" MP_AUTO_UPDATE_RESOURCE)"
 
 echo "--- B 覆盖安装：保留密钥与用户配置 ---"
 ENV_B="${WORK}/b.env"
@@ -105,6 +108,10 @@ expect_eq "B6 向导未填时密码不被清空" "OldPass@1" \
     "$(key_value "${ENV_B}" SUPERUSER_PASSWORD)"
 expect_eq "B7 已有端口保留" "3011" "$(key_value "${ENV_B}" PORT)"
 expect_eq "B8 缺失键补默认值" "1" "$(key_value "${ENV_B}" MP_AUTO_UPDATE)"
+# B9：站点资源同步开关也是"覆盖安装必须补齐"的新键（老 app.env 没有它）。
+# 默认 1 —— 关掉它站点资源就永远不更新，只能是用户显式选择的结果。
+expect_eq "B9 站点资源同步开关补默认值" "1" \
+    "$(key_value "${ENV_B}" MP_AUTO_UPDATE_RESOURCE)"
 
 echo "--- C 覆盖安装 + 向导显式值 ---"
 export wizard_port=3999
@@ -211,6 +218,27 @@ def contract_checks() -> None:
           config_cb.count("mp_env_upsert") >= 3)
     check("K. cmd/main 启动前兜底补密钥",
           "start)" in main and "mp_env_ensure_secret" in main)
+    # L. 站点资源同步开关：默认值必须由 lib.sh（安装）与 config_callback（改配置）
+    #    两处都补齐，否则老包升级上来的 app.env 永远没有这个键，更新器只能吃默认值，
+    #    用户在面板上关不掉也开不了。
+    check("L. lib.sh 全新安装模板含 MP_AUTO_UPDATE_RESOURCE",
+          "MP_AUTO_UPDATE_RESOURCE=1" in lib)
+    check("L. lib.sh 覆盖安装补齐 MP_AUTO_UPDATE_RESOURCE",
+          'mp_env_ensure "${env_file}" "MP_AUTO_UPDATE_RESOURCE" "1"' in lib)
+    check("L. config_callback 补齐 MP_AUTO_UPDATE_RESOURCE",
+          'mp_env_ensure "${ENV_FILE}" "MP_AUTO_UPDATE_RESOURCE" "1"' in config_cb)
+    # 非 0/1 一律按开启处理：与 MP_AUTO_UPDATE 同口径，避免把能自愈的资源同步误关。
+    check("L. config_callback 对非预期开关值按开启兜底",
+          '*)   MP_AUTO_UPDATE_RESOURCE_VALUE="1" ;;' in config_cb)
+    # M. 重启路径必须真的调用资源同步，否则"重启即同步"只是文档里的一句话。
+    check("M. cmd/main 启动路径调用 --resources 同步",
+          "--resources" in main and "run_updater --resources --auto" in main)
+    # M. 资源同步失败不得阻塞启动：调用点必须 `|| true`（与主程序更新一致）。
+    check("M. cmd/main 资源同步失败不阻塞启动",
+          "run_updater --resources --auto || true" in main)
+    # M. run_updater 必须把 rc=11 当成功（不补 stdio、不打印"未完成"）。
+    check("M. run_updater 把 11 视为成功退出码",
+          '[ "$rc" != "11" ]' in main and '11)  log "==> 已更新站点资源' in main)
 
 
 def main() -> int:

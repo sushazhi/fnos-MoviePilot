@@ -43,6 +43,12 @@ import mp_updater as mod  # noqa: E402
 # 否则测的就是那个 lambda —— 表现为"用例永远通过/永远失败"。
 REAL_INSTALL_DEPS = mod.install_dependencies
 
+# 资源文件名不能写死：verify_site_resources 要求扩展 ABI 与**当前解释器**一致
+# （cp314-aarch64-linux-gnu.so 是 fnOS 目标平台，在 Windows/cp312 的开发机上会被
+# 正确地判为"缺少本机可用的 sites 扩展"）。写死会让整套用例只在目标平台能过，
+# 开发机上永远红着，反而掩盖真正的回归。这里直接取更新器的推导结果。
+INDEX_NAME, NATIVE_NAME = mod.needed_resource_files()
+
 FAILS = []
 
 
@@ -70,8 +76,8 @@ def build_sandbox(tag="v3.0.4"):
     (mp / "version.py").write_text(
         "APP_VERSION = 'v3.0.3'\nFRONTEND_VERSION = 'v3.0.3'\n", encoding="utf-8")
     (mp / "app" / "main.py").write_text("print('old backend')\n", encoding="utf-8")
-    (mp / "app" / "helper" / "user.sites.v3.bin").write_text("OLD-SITES-DATA", encoding="utf-8")
-    (mp / "app" / "helper" / "sites.cpython-314-aarch64-linux-gnu.so").write_bytes(b"OLD-SO")
+    (mp / "app" / "helper" / INDEX_NAME).write_text("OLD-SITES-DATA", encoding="utf-8")
+    (mp / "app" / "helper" / NATIVE_NAME).write_bytes(b"OLD-SO")
     (mp / "app" / "helper" / ".resource-compat").write_text("compat", encoding="utf-8")
     # 空清单：候选范围为空集，真实 pip 安装由各场景自行打桩
     (mp / "requirements.lock.txt").write_text("", encoding="utf-8")
@@ -137,12 +143,14 @@ def scenario_a():
     check("A1 退出码=10（已更新）", rc == mod.EXIT_UPDATED, f"rc={rc}")
     check("A2 后端版本已升级", "APP_VERSION = 'v3.0.4'" in (mp / "version.py").read_text())
     check("A3 后端代码已替换", "new backend" in (mp / "app" / "main.py").read_text())
-    helper = mp / "app" / "helper"
+    # A4/A5 回填目标用 resolve_resource_dir 推导，而不是写死 app/helper：
+    # 回填的本意就是"把资源搬到新版代码认的目录"，新版目录是 app/application/site。
+    # 写死旧目录会让断言与实现口径脱节（实现搬对了反而判失败）。
+    res_dir = mod.resolve_resource_dir(mp)
     check("A4 资源文件已回填（user.sites）",
-          (helper / "user.sites.v3.bin").exists()
-          and (helper / "user.sites.v3.bin").read_text() == "OLD-SITES-DATA")
-    check("A5 资源文件已回填（sites.so）",
-          (helper / "sites.cpython-314-aarch64-linux-gnu.so").exists())
+          (res_dir / INDEX_NAME).exists()
+          and (res_dir / INDEX_NAME).read_text() == "OLD-SITES-DATA", str(res_dir))
+    check("A5 资源文件已回填（sites.so）", (res_dir / NATIVE_NAME).exists(), str(res_dir))
     check("A6 前端已替换（dist/ 提升）", "new" in (fe / "index.html").read_text())
     state = json.loads((cfgdir / "mp_update.json").read_text(encoding="utf-8"))
     check("A7 状态文件记录新版本", state.get("backend_version") == "v3.0.4", str(state))
@@ -183,7 +191,7 @@ def scenario_b():
     check("B2 版本保持旧版", "v3.0.3" in (mp / "version.py").read_text())
     check("B3 后端代码保持旧版", "old backend" in (mp / "app" / "main.py").read_text())
     check("B4 资源文件仍在",
-          (mp / "app" / "helper" / "user.sites.v3.bin").read_text() == "OLD-SITES-DATA")
+          (mp / "app" / "helper" / INDEX_NAME).read_text() == "OLD-SITES-DATA")
     check("B5 前端保持旧版", "old" in (fe / "index.html").read_text())
     state = json.loads((cfgdir / "mp_update.json").read_text(encoding="utf-8"))
     check("B6 记录失败次数", int((state.get("failures") or {}).get("v3.0.4", 0)) == 1, str(state))
@@ -313,7 +321,7 @@ def scenario_g():
     """
     print("\n=== 场景 G：命令行参数契约（与 cmd/main 保持一致）===")
     script = ROOT / "app" / "bin" / "mp_updater.py"
-    expected = ["--check", "--rollback", "--force", "--auto"]
+    expected = ["--check", "--rollback", "--force", "--auto", "--resources"]
 
     # 1) 直接解析 argparse 定义，而不真的执行各开关：
     #    --force / --rollback 会真的联网下载或回滚，跑起来既慢又不确定。
@@ -592,6 +600,251 @@ def scenario_j():
     mod.installed_versions = real_installed
 
 
+def build_resource_sandbox():
+    """为场景 K 造一个"当前目录布局"的沙箱（资源在 app/application/site）。
+
+    不复用 build_sandbox()：那里资源故意放在旧目录 app/helper（测回填），
+    而资源同步要测的是"新版目录里就地升级"，两件事的起点不同。
+    """
+    root = SANDBOX / "res"
+    if root.exists():
+        shutil.rmtree(root)
+    mp = root / "mp"
+    res_dir = mp / "app" / "application" / "site"
+    cfgdir = root / "pkgvar" / "config"
+    tmp = root / "pkgvar" / "tmp"
+    for d in (res_dir, cfgdir, tmp):
+        d.mkdir(parents=True, exist_ok=True)
+    (mp / "version.py").write_text("APP_VERSION = 'v3.0.3'\n", encoding="utf-8")
+    (res_dir / "user.sites.v3.bin").write_text("OLD-INDEX", encoding="utf-8")
+    index_name, native_name = mod.needed_resource_files()
+    (res_dir / native_name).write_bytes(b"OLD-NATIVE")
+    (cfgdir / "app.env").write_text("CONFIG_DIR=%s\n" % cfgdir, encoding="utf-8")
+    os.environ["MP_SRC"] = str(mp)
+    os.environ["CONFIG_DIR"] = str(cfgdir)
+    os.environ["TRIM_PKGTMP"] = str(tmp)
+    os.environ["APP_PYTHON"] = sys.executable
+    os.environ.pop("MP_AUTO_UPDATE_RESOURCE", None)
+    return mp, res_dir, cfgdir, index_name, native_name
+
+
+def resource_manifest(index_name, native_name, *, index_version="3.0.17",
+                      native_version="3.0.4", target="app/application/site",
+                      platform_name=None, drop=None, extra=None):
+    """按本机所需文件名造一份 package.v3.json（内容与上游同构）。"""
+    if platform_name is None:
+        platform_name = mod.resource_platform()
+    resources = {
+        index_name: {"type": "sites", "target": target, "version": index_version},
+        native_name: {"type": "auth", "platform": platform_name, "target": target,
+                      "version": native_version},
+    }
+    for name in (drop or ()):
+        resources.pop(name, None)
+    resources.update(extra or {})
+    return json.dumps({"version": "20", "resources": resources})
+
+
+def scenario_k():
+    """K 站点资源同步（认证扩展 + 站点索引，独立发布通道）。
+
+    这是本仓库原先完全缺失的一半：主程序走 Release 更新，站点资源只在重装 fpk 时
+    才跟着变。真实故障形态是"扩展换了、索引没换"→ 站点列表解不开，而文件一个不少。
+    所以这里的断言重点是：**成对替换 + 失败整批回滚 + 不阻塞启动**。
+    全部离线打桩（不碰网络），并把版本探测替换成确定值（Windows 上无法真加载扩展）。
+    """
+    print("\n=== 场景 K：站点资源同步（认证扩展 + 站点索引）===")
+    mp, res_dir, cfgdir, index_name, native_name = build_resource_sandbox()
+    cfg = mod.Config()
+
+    real_fetch, real_download = mod.fetch_text, mod.download_file
+    real_probe, real_verify = mod.probe_local_resource_versions, mod.verify_site_resources
+
+    # 版本探测打桩：按索引文件内容判断"装了没有"，模拟真实扩展的 auth_version/
+    # indexer_version（本机是 Windows/cp312，真加载 .pyd 不现实）。
+    def fake_probe(c):
+        if (res_dir / "user.sites.v3.bin").read_text(encoding="utf-8") == "NEW-INDEX":
+            return ("3.0.4", "3.0.17")
+        return ("3.0.3", "3.0.12")
+
+    downloaded = []
+
+    def fake_download(url, dest, proxies, timeout=60):
+        downloaded.append(url)
+        name = Path(dest).name
+        Path(dest).write_text("NEW-INDEX" if name == index_name else "NEW-NATIVE",
+                              encoding="utf-8")
+        return True
+
+    manifest = resource_manifest(index_name, native_name)
+    mod.fetch_text = lambda url, proxies, timeout, deadline=None, limit=0: (url, manifest)
+    mod.download_file = fake_download
+    mod.probe_local_resource_versions = fake_probe
+    mod.verify_site_resources = lambda src: None
+
+    # K1 清单 target 必须等于当前源码里资源真正所在的目录（写死上游当前布局）
+    check("K1 资源 target 为 app/application/site",
+          mod.RESOURCE_TARGET == Path("app/application/site"), str(mod.RESOURCE_TARGET))
+    # K2 ABI 标签取自**当前解释器**，而不是写死的 cp314：更新器由 $APP_PYTHON 启动，
+    # 若这里写死，换运行时后会把 ABI 不符的扩展装进去（ImportError，后端起不来）。
+    py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    check("K2 扩展名含当前解释器 ABI 标签", py_tag in native_name, native_name)
+
+    # K3 旧版本 → 触发同步，退出码 11
+    rc = mod.do_resources(cfg, Namespace(force=False))
+    check("K3 有更新时退出码=11", rc == mod.EXIT_RESOURCE_UPDATED, f"rc={rc}")
+    check("K4 索引已替换", (res_dir / "user.sites.v3.bin").read_text(encoding="utf-8") == "NEW-INDEX")
+    check("K5 认证扩展已替换（成对）", (res_dir / native_name).read_text(encoding="utf-8") == "NEW-NATIVE")
+    check("K6 两个文件都下载（索引+扩展）", len(downloaded) == 2, str(downloaded))
+    state = json.loads((cfgdir / "mp_update.json").read_text(encoding="utf-8"))
+    check("K7 状态文件记录资源版本",
+          (state.get("resource_versions") or {}).get("indexer") == "3.0.17", str(state))
+    check("K8 资源检查时间戳与主程序分开记",
+          "resource_checked_at" in state and "checked_at" not in state, str(sorted(state)))
+    backups = sorted((mp.parent / ".mp-res-backup").iterdir())
+    check("K9 生成资源备份（含旧索引）", len(backups) == 1 and
+          (backups[0] / "user.sites.v3.bin").read_text(encoding="utf-8") == "OLD-INDEX",
+          str(backups))
+    # K10 资源备份必须是 .mp-backup 的兄弟目录：若挂在它下面，`--rollback`（按目录名
+    # 取最近一次）会把这个只含两个资源文件的目录当成主程序备份去恢复。
+    check("K10 资源备份不在主程序备份目录内",
+          not str(cfg.resource_backup_root).startswith(str(cfg.backup_root) + os.sep),
+          f"{cfg.resource_backup_root} vs {cfg.backup_root}")
+
+    # K11 冷却：同一次会话内再跑不重复下载
+    before = len(downloaded)
+    rc = mod.do_resources(cfg, Namespace(force=False))
+    check("K11 冷却期内不重复下载", rc == mod.EXIT_OK and len(downloaded) == before, f"rc={rc}")
+    # K12 已是最新（--force 绕过冷却）→ 0，且不再下载
+    rc = mod.do_resources(cfg, Namespace(force=True))
+    check("K12 已是最新时退出码=0 且不下载",
+          rc == mod.EXIT_OK and len(downloaded) == before, f"rc={rc}")
+
+    # K13 清单缺文件 → 拒绝（绝不半装）
+    mod.fetch_text = lambda url, proxies, timeout, deadline=None, limit=0: (
+        url, resource_manifest(index_name, native_name, drop=(native_name,)))
+    try:
+        mod.do_resources(cfg, Namespace(force=True))
+        check("K13 清单缺文件时拒绝", False, "未抛错")
+    except mod.UpdateError as e:
+        check("K13 清单缺文件时拒绝", "资源包清单缺少当前平台文件" in str(e), str(e))
+
+    # K14 平台不符 → 拒绝（跨平台装错 ABI 是 ImportError）
+    mod.fetch_text = lambda url, proxies, timeout, deadline=None, limit=0: (
+        url, resource_manifest(index_name, native_name, platform_name="MacOS"))
+    try:
+        mod.do_resources(cfg, Namespace(force=True))
+        check("K14 平台不符时拒绝", False, "未抛错")
+    except mod.UpdateError as e:
+        check("K14 平台不符时拒绝", "资源包平台不匹配" in str(e), str(e))
+
+    # K15 target 指向别处 → 拒绝（清单被篡改时不许写到任意目录）
+    mod.fetch_text = lambda url, proxies, timeout, deadline=None, limit=0: (
+        url, resource_manifest(index_name, native_name, target="app/helper"))
+    try:
+        mod.do_resources(cfg, Namespace(force=True))
+        check("K15 非法 target 时拒绝", False, "未抛错")
+    except mod.UpdateError as e:
+        check("K15 非法 target 时拒绝", "资源包目标目录不安全" in str(e), str(e))
+
+    # K16 下载失败 → 不改动现有资源（下载全成功才动运行目录）
+    mod.fetch_text = lambda url, proxies, timeout, deadline=None, limit=0: (url, manifest)
+    mod.download_file = lambda *a, **k: False
+    mod.probe_local_resource_versions = lambda c: ("3.0.3", "3.0.12")
+    rc = mod.do_resources(cfg, Namespace(force=True))
+    check("K16 下载失败时退出码=1", rc == mod.EXIT_FAILED, f"rc={rc}")
+    check("K17 下载失败后资源原样保留",
+          (res_dir / "user.sites.v3.bin").read_text(encoding="utf-8") == "NEW-INDEX"
+          and (res_dir / native_name).read_text(encoding="utf-8") == "NEW-NATIVE")
+
+    # K18 安装后校验失败 → 整批回滚到**改动前**的资源（成对回滚）
+    # 先把磁盘上的资源改成一组已知的"旧值"，这样"回滚成功"才可证伪：
+    # 如果只断言"文件还在"，装坏不回滚也会通过。
+    (res_dir / "user.sites.v3.bin").write_text("PREV-INDEX", encoding="utf-8")
+    (res_dir / native_name).write_text("PREV-NATIVE", encoding="utf-8")
+    mod.download_file = fake_download          # 会写出 NEW-INDEX / NEW-NATIVE
+    mod.verify_site_resources = lambda src: (_ for _ in ()).throw(
+        mod.UpdateError("模拟校验失败"))
+    rc = mod.do_resources(cfg, Namespace(force=True))
+    check("K18 校验失败时退出码=1", rc == mod.EXIT_FAILED, f"rc={rc}")
+    check("K19 校验失败后索引回滚到改动前",
+          (res_dir / "user.sites.v3.bin").read_text(encoding="utf-8") == "PREV-INDEX",
+          (res_dir / "user.sites.v3.bin").read_text(encoding="utf-8"))
+    check("K19b 校验失败后扩展一并回滚（成对）",
+          (res_dir / native_name).read_text(encoding="utf-8") == "PREV-NATIVE",
+          (res_dir / native_name).read_text(encoding="utf-8"))
+    state = json.loads((cfgdir / "mp_update.json").read_text(encoding="utf-8"))
+    check("K20 失败被计入 resource_failures", bool(state.get("resource_failures")), str(state))
+
+    # K21 开关关闭 → 不检查不下载（MP_AUTO_UPDATE_RESOURCE=0）
+    os.environ["MP_AUTO_UPDATE_RESOURCE"] = "0"
+    cfg_off = mod.Config()
+    before = len(downloaded)
+    rc = mod.do_resources(cfg_off, Namespace(force=False))
+    check("K21 开关关闭时不下载", rc == mod.EXIT_OK and len(downloaded) == before, f"rc={rc}")
+    os.environ.pop("MP_AUTO_UPDATE_RESOURCE", None)
+
+    # K22 失败冷却：连续失败达到上限后**不再重试**（与主程序 MAX_FAILURES 同口径）。
+    # 每次先把检查时间戳清零让冷却过期 —— 否则测的是冷却分支，不是失败计数分支。
+    def _expire_cooldown():
+        st = json.loads((cfgdir / "mp_update.json").read_text(encoding="utf-8"))
+        st["resource_checked_at"] = 0
+        (cfgdir / "mp_update.json").write_text(json.dumps(st), encoding="utf-8")
+
+    mod.verify_site_resources = lambda src: (_ for _ in ()).throw(mod.UpdateError("x"))
+    for _ in range(mod.MAX_FAILURES):
+        _expire_cooldown()
+        mod.do_resources(mod.Config(), Namespace(force=False))
+    state = json.loads((cfgdir / "mp_update.json").read_text(encoding="utf-8"))
+    fails = int((state.get("resource_failures") or {}).get("20", 0))
+    check("K22a 连续失败被累计", fails == mod.MAX_FAILURES, str(fails))
+    _expire_cooldown()
+    before = len(downloaded)
+    rc = mod.do_resources(mod.Config(), Namespace(force=False))
+    check("K22b 达到失败上限后不再尝试（冷却过期也不下载）",
+          rc == mod.EXIT_OK and len(downloaded) == before, f"rc={rc}")
+
+    # K23 只读检查不落盘（--check --resources）：此刻磁盘仍是 PREV-*（旧），
+    # 清单是 3.0.4/3.0.17，所以应报"有更新"。
+    mod.verify_site_resources = lambda src: None
+    mod.fetch_text = lambda url, proxies, timeout, deadline=None, limit=0: (url, manifest)
+    info = mod.check_resources(mod.Config())
+    check("K23 check_resources 报告本地/远端版本并判定有更新",
+          info.get("local") == {"auth": "3.0.3", "indexer": "3.0.12"}
+          and info.get("latest") == {"auth": "3.0.4", "indexer": "3.0.17"}
+          and info.get("update_available") is True, str(info))
+
+    # K24 中途安装失败（第二个文件复制失败）→ 第一个文件也必须回滚。
+    # 这是最容易漏的一条：安装是逐个文件做的，若等函数返回才拿到回滚清单，
+    # 已经替换掉的那个就漏在回滚之外 —— 结果正是"扩展换了、索引没换"的坏状态。
+    (res_dir / "user.sites.v3.bin").write_text("PREV-INDEX", encoding="utf-8")
+    (res_dir / native_name).write_text("PREV-NATIVE", encoding="utf-8")
+    mod.verify_site_resources = lambda src: None
+    real_copy2 = mod.shutil.copy2
+    calls = {"n": 0}
+
+    def flaky_copy2(src, dst, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("模拟磁盘写入失败")
+        return real_copy2(src, dst, *a, **k)
+
+    mod.shutil.copy2 = flaky_copy2
+    rc = mod.do_resources(cfg, Namespace(force=True))
+    mod.shutil.copy2 = real_copy2
+    check("K24 中途安装失败时退出码=1", rc == mod.EXIT_FAILED, f"rc={rc}")
+    check("K25 已替换的第一个文件被回滚",
+          (res_dir / "user.sites.v3.bin").read_text(encoding="utf-8") == "PREV-INDEX",
+          (res_dir / "user.sites.v3.bin").read_text(encoding="utf-8"))
+    check("K26 第二个文件保持原样",
+          (res_dir / native_name).read_text(encoding="utf-8") == "PREV-NATIVE",
+          (res_dir / native_name).read_text(encoding="utf-8"))
+
+    mod.fetch_text, mod.download_file = real_fetch, real_download
+    mod.probe_local_resource_versions = real_probe
+    mod.verify_site_resources = real_verify
+
+
 if __name__ == "__main__":
     mod._real_smoke_test = mod.smoke_test
     scenario_a()
@@ -605,5 +858,6 @@ if __name__ == "__main__":
     scenario_h()
     scenario_i()
     scenario_j()
+    scenario_k()
     print("\n" + ("全部通过" if not FAILS else f"失败 {len(FAILS)} 项: {FAILS}"))
     sys.exit(1 if FAILS else 0)
