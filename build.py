@@ -130,7 +130,7 @@ UV_PLATFORM = {
 # 注意上游自己会用 `-N` 表示「同一版本的重新打包」（如 v3.0.10-1），
 # 所以 tag 形态是 v3.x.y 或 v3.x.y-N，本仓库的 manifest.version 直接沿用该版本号。
 UPSTREAM_REPO = "jxxghp/MoviePilot"
-UPSTREAM_TAG = "v3.1.0"
+UPSTREAM_TAG = "v3.1.1"
 # 前端仓库：发布 dist.zip 的 Release tag 由后端源码的 FRONTEND_VERSION 决定，
 # 不跟随 UPSTREAM_TAG（后端 v3.0.10-1 重新打包时前端仍是 v3.0.10）。
 UPSTREAM_FE_REPO = "jxxghp/MoviePilot-Frontend"
