@@ -31,4 +31,4 @@ desktop_applaunchname = moviepilot.Application
 install_dep_apps      = nodejs_v24
 
 # 更新日志
-changelog             = v3.1.1<br>1.跟进上游 MoviePilot v3.1.1：构建 pin 与 manifest 版本同步更新，包名版本与上游 tag 一一对应<br>2.上游源码零改动原样集成，仅做 fnOS 打包适配（生命周期脚本、统一网关、桌面入口）<br>3.自带 CPython 3.14.7 运行时与全部依赖，安装时无需联网<br>4.本条目由 GitHub Actions 定时检查上游后自动生成
+changelog             = v3.1.1<br>1.跟进上游 MoviePilot v3.1.1<br>2.本条目由 GitHub Actions 定时检查上游后自动生成
