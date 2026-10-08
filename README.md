@@ -374,6 +374,33 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 > 注意：通过 fpk 重新安装/升级应用时，应用目录会被整包替换，自更新的内容随之回到
 > 安装包自带的版本（这是预期行为，也让"应用包升级"始终是可靠的回退路径）。
 
+### 应用中心装包升级的耗时构成（以及为什么不慢）
+
+`upgrade` 由 `upgrade_init` → 整包替换 → `upgrade_callback` 三段组成，其中两处做过
+专门优化，避免把"装个包"拖成几分钟：
+
+| 阶段 | 内容 | 说明 |
+|------|------|------|
+| `upgrade_init` | 停服务 + 备份 config | 停服务最多等 30s（后端要收敛在途任务）；备份按**硬链接 → reflink → 全量拷贝**降级，同文件系统下近乎瞬时 |
+| 整包替换 | fnOS 解压 fpk 覆盖 `TRIM_APPDEST` | 体积主要来自自带的 CPython 3.14 + 全部依赖（数百 MB），这是"安装时零联网"的代价 |
+| `upgrade_callback` | 运行时自检 + 数据库迁移 + 重启 | 自带运行时时**跳过 pip**（只做秒级 import 自检）；重启带 `MP_SKIP_UPDATE=1` |
+
+两个关键优化点：
+
+- **`upgrade_init` 的配置备份不再无条件全量拷贝**。config/ 含 SQLite 库、插件、缓存与
+  图片，全量 `cp -a` 是实打实的 IO；故按代价从低到高降级：先用 `cp -al` 硬链接（秒级、
+  不占额外空间），不支持时退 `--reflink=auto`（btrfs/XFS 的 CoW 克隆），最后才全量拷贝。
+  每档都校验结果非空，避免静默留下半份备份 —— 恢复不到 `app.env` 会直接让应用起不来。
+- **`upgrade_callback` 的重启带 `MP_SKIP_UPDATE=1`，跳过启动前的联网更新检查**。这一刻
+  程序目录刚被整包替换，`version.py` 就是包里那份，远端查询的结论注定是"已是最新"。
+  而该检查是四级降级 + 120s 整体预算，在 `api.github.com` 直连不通的受限网络里不会快速
+  失败，要逐级走完 API → 网页 → atom → 分支 raw，算上 `--resources` 的第二遍，一次升级
+  能白烧一两分钟。跳过不影响正确性：`repair_resources`（纯本地、不联网）仍会执行，而下次
+  正常重启或手动 `cmd/main update` 仍照常联网检查。
+
+> 排查装包升级耗时，看 `TRIM_PKGVAR` 下的三份日志：`upgrade.log`（停服务 / 备份模式 /
+> 迁移 / 重启）、`install.log`（依赖安装）、`update.log`（联网检查与下载，每行带完整 URL）。
+
 ## 已知假设与限制
 
 - 本包为**原生 Native 应用**。MoviePilot V3 要求 `requires-python >= 3.14`，因此正常产物通过 `--with-runtime` 自带 CPython 3.14 与全部依赖（含 langchain、Rust 扩展等），安装时不联网，也**不需要 fnOS 的 python312**（`manifest` 已不再声明）

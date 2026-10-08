@@ -16,11 +16,64 @@ BACKUP_DIR="${DATA_SHARE}/.moviepilot_backup"
 # 备份配置（含 SQLite 数据库）。
 # 先清掉上次升级可能遗留的旧备份：cp -a 遇已存在的目标会嵌套成 backup/config/config，
 # 导致升级后按 backup/config/ 恢复时找不到 app.env。
+#
+# 为什么要做快速路径（而不是直接 cp -a 全量）：
+#   config/ 里装着 SQLite 库 + 插件 + 缓存 + 图片，全量拷贝在库大的机器上是
+#   实打实的 IO 时间，而这份备份**绝大多数升级都用不上**（它是防"TRIM_PKGVAR
+#   被清空"的保险，应用中心原地升级并不会清）。所以按代价从低到高依次尝试：
+#     1) cp -al  —— 硬链接。同文件系统下近乎瞬时且不占额外空间。config/ 与其
+#        下文件在升级过程中不会被就地改写（升级只整包替换 TRIM_APPDEST，不动
+#        TRIM_PKGVAR），所以硬链接共享 inode 是安全的。
+#     2) cp -a --reflink=auto —— btrfs/XFS 上是 CoW 克隆，同样接近瞬时；
+#        不支持时 cp 会自行退化为普通拷贝（--reflink=auto 语义），故不能据此
+#        判断成功，只作为"比全量稍好"的中间档。
+#     3) cp -a / cp -r —— 全量拷贝兜底，跨文件系统（硬链接会报 Invalid
+#        cross-device link）或不支持 reflink 时的最终手段。
+#   每一档都校验备份结果**非空**再认账：--reflink=auto 在不支持的文件系统上
+#   不报错、硬链接也可能因权限只成功一部分，静默留下半份备份比慢更糟 ——
+#   升级后恢复不到 app.env 会直接让应用起不来。
+backup_config() {
+    local src="$1" dst="$2"
+    [ -d "${src}" ] || return 0
+
+    rm -rf "${dst}"
+    mkdir -p "${dst}"
+
+    # 1) 硬链接（最快）
+    if cp -al "${src}/." "${dst}/" 2>/dev/null && [ -n "$(ls -A "${dst}" 2>/dev/null)" ]; then
+        echo "1"
+        return 0
+    fi
+    rm -rf "${dst}"; mkdir -p "${dst}"
+
+    # 2) reflink 克隆（btrfs/XFS），不支持时 cp 自动退化为普通拷贝
+    if cp -a --reflink=auto "${src}/." "${dst}/" 2>/dev/null && [ -n "$(ls -A "${dst}" 2>/dev/null)" ]; then
+        echo "2"
+        return 0
+    fi
+    rm -rf "${dst}"; mkdir -p "${dst}"
+
+    # 3) 全量拷贝兜底
+    if cp -a "${src}/." "${dst}/" 2>/dev/null || cp -r "${src}/." "${dst}/" 2>/dev/null; then
+        echo "3"
+        return 0
+    fi
+    return 1
+}
+
 if [ -d "${CONFIG_DIR}" ]; then
     rm -rf "${BACKUP_DIR}"
     mkdir -p "${BACKUP_DIR}"
-    cp -a "${CONFIG_DIR}" "${BACKUP_DIR}/config" 2>/dev/null || \
-        cp -r "${CONFIG_DIR}" "${BACKUP_DIR}/config"
-    echo "备份完成：${BACKUP_DIR}" >> "${TRIM_PKGVAR}/upgrade.log"
+    # 注意目标写成 "${BACKUP_DIR}/config"：升级回调按 backup/config/ 恢复 app.env。
+    BACKUP_MODE="$(backup_config "${CONFIG_DIR}" "${BACKUP_DIR}/config")" || BACKUP_MODE=""
+    case "${BACKUP_MODE}" in
+        1) echo "备份完成（硬链接）：${BACKUP_DIR}" >> "${TRIM_PKGVAR}/upgrade.log" ;;
+        2) echo "备份完成（reflink/快速拷贝）：${BACKUP_DIR}" >> "${TRIM_PKGVAR}/upgrade.log" ;;
+        3) echo "备份完成（全量拷贝）：${BACKUP_DIR}" >> "${TRIM_PKGVAR}/upgrade.log" ;;
+        *) # 备份失败不应中断升级：fnOS 原地升级不会清 TRIM_PKGVAR，备份只是保险。
+           # 但必须留下明确记录，否则真需要恢复时才发现没有备份。
+           echo "警告: 配置备份失败（${CONFIG_DIR} -> ${BACKUP_DIR}/config），继续升级" \
+               >> "${TRIM_PKGVAR}/upgrade.log" ;;
+    esac
 fi
 exit 0

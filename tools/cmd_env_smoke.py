@@ -167,6 +167,55 @@ mode_after="$(stat -c '%a' "${ENV_F}" 2>/dev/null || stat -f '%Lp' "${ENV_F}" 2>
 expect_eq "F1 upsert 不改变文件权限（用 cat 覆盖而非 mv）" "${mode_before}" "${mode_after}"
 expect_eq "F2 upsert 结果正确" "3003" "$(key_value "${ENV_F}" PORT)"
 
+# --- G 配置备份快速路径（upgrade_init 的 backup_config） ---
+# upgrade_init 是生命周期脚本（不是可 source 的库），这里只抽出 backup_config 函数体
+# 单独求值 —— 目的是验证"降级链真的能产出可用备份"，而不是把整个升级流程跑一遍。
+echo "--- G 配置备份降级链 ---"
+BACKUP_FN="$(sed -n '/^backup_config() {/,/^}/p' "${REPO}/cmd/upgrade_init")"
+if [ -z "${BACKUP_FN}" ]; then
+    bad "G0 未能从 upgrade_init 抽出 backup_config"
+else
+    ok "G0 backup_config 可抽取"
+    eval "${BACKUP_FN}"
+
+    # 造一个有内容的 config 目录（含子目录与二进制样文件）
+    SRC="${WORK}/cfg_src"
+    rm -rf "${SRC}"; mkdir -p "${SRC}/sub"
+    printf 'SECRET_KEY=abc\n' > "${SRC}/app.env"
+    printf 'userdb' > "${SRC}/user.db"
+    printf 'nested' > "${SRC}/sub/deep.bin"
+
+    DST="${WORK}/cfg_dst"
+    MODE="$(backup_config "${SRC}" "${DST}")"
+    case "${MODE}" in 1|2|3) ok "G1 备份返回有效模式（${MODE}）" ;;
+                  *) bad "G1 备份模式异常（[${MODE}]）" ;; esac
+
+    # 关键语义：备份必须**内容完整**，无论走的是硬链接还是拷贝。
+    # 硬链接档最容易出的错是只链了顶层、子目录没进去。
+    expect_eq "G2 顶层文件已备份" "SECRET_KEY=abc" "$(cat "${DST}/app.env" 2>/dev/null)"
+    expect_eq "G3 子目录文件已备份" "nested" "$(cat "${DST}/sub/deep.bin" 2>/dev/null)"
+    expect_eq "G4 数据库已备份" "userdb" "$(cat "${DST}/user.db" 2>/dev/null)"
+
+    # 备份是"快照"语义：源被改后备份不应跟着变（硬链接会跟着变是已知取舍，
+    # 但升级流程在备份后不再写 config/，所以这里只钉住"备份自成一份可用副本"）。
+    rm -rf "${SRC}"
+    expect_eq "G5 源目录删除后备份仍可读" "SECRET_KEY=abc" "$(cat "${DST}/app.env" 2>/dev/null)"
+
+    # 目标已存在时必须先清空：cp -a 遇已存在目录会嵌套成 dst/config/config，
+    # 升级回调按 backup/config/ 取 app.env 就会找不到（历史事故）。
+    mkdir -p "${DST}/config"
+    printf 'stale' > "${DST}/config/old.env"
+    backup_config "${SRC}" "${DST}" >/dev/null 2>&1 || true
+    expect_eq "G6 不产生嵌套的 dst/config/config" "no" \
+        "$([ -d "${DST}/config/config" ] && echo yes || echo no)"
+
+    # 源目录不存在时应安静返回，不应造出空备份目录来骗过恢复判断
+    rm -rf "${WORK}/absent" "${WORK}/absent_dst"
+    backup_config "${WORK}/absent" "${WORK}/absent_dst" >/dev/null 2>&1
+    expect_eq "G7 源不存在时不报错且不建目标" "no" \
+        "$([ -d "${WORK}/absent_dst" ] && echo yes || echo no)"
+fi
+
 exit ${fail}
 """
 
@@ -240,10 +289,51 @@ def contract_checks() -> None:
     check("M. run_updater 把 11 视为成功退出码",
           '[ "$rc" != "11" ]' in main and '11)  log "==> 已更新站点资源' in main)
 
+    # N. 装包升级路径必须跳过启动前的联网更新检查。
+    #    upgrade_callback 末尾会调 cmd/main restart，而 cmd/main 的 start 分支会跑
+    #    两遍 run_updater（主程序 + 站点资源）。装包这一刻程序目录刚被整包替换，
+    #    version.py 就是包里那份，联网查询注定返回"已是最新"；而该检查是四级降级
+    #    + 120s 预算，在 api.github.com 直连不通的受限网络里要逐级走完才失败，
+    #    一次升级白烧一两分钟。丢了 MP_SKIP_UPDATE=1 就会把这个耗时加回来。
+    upgrade_cb = read(CMD / "upgrade_callback")
+    check("N. upgrade_callback 重启时带 MP_SKIP_UPDATE=1",
+          "MP_SKIP_UPDATE=1" in upgrade_cb)
+    check("N. MP_SKIP_UPDATE=1 直接作用于 cmd/main 调用",
+          'MP_SKIP_UPDATE=1 "${TRIM_APPDEST}/cmd/main" restart' in upgrade_cb)
+    # N. 该开关必须真的被 cmd/main 认（否则只是个无意义的变量）。
+    check("N. cmd/main 尊重 MP_SKIP_UPDATE（跳过两段联网检查）",
+          main.count('[ "${MP_SKIP_UPDATE:-}" != "1" ]') >= 2)
+    # N. 跳过联网检查时 repair_resources 仍必须执行：纯本地资源对位不能一起被跳过，
+    #    否则"更新后 sites 目录错位"这类历史故障会失去启动前的自愈机会。
+    check("N. 跳过更新不影响 repair_resources 执行",
+          "repair_resources" in main)
+
+    # O. 升级备份必须走"硬链接 → reflink → 全量拷贝"的降级链，且校验结果非空。
+    #    旧的 `cp -a` 无条件全量拷贝 config/（含 SQLite 库、插件、缓存、图片），
+    #    是应用中心装包升级里实打实的 IO 时间。降级链每一档都要判空，否则
+    #    --reflink=auto 在不支持的文件系统上会静默留下半份备份。
+    upgrade_init = read(CMD / "upgrade_init")
+    check("O. upgrade_init 抽出 backup_config 函数",
+          "backup_config()" in upgrade_init)
+    check("O. 第一档为硬链接 cp -al", 'cp -al "${src}/."' in upgrade_init)
+    check("O. 第二档为 reflink 克隆", "--reflink=auto" in upgrade_init)
+    check("O. 末档为全量拷贝兜底",
+          'cp -a "${src}/." "${dst}/" 2>/dev/null || cp -r "${src}/." "${dst}/"' in upgrade_init)
+    # 每一档都必须判非空，这是"备份可用"的底线。
+    check("O. 每档都校验备份非空",
+          upgrade_init.count('[ -n "$(ls -A "${dst}" 2>/dev/null)" ]') >= 2)
+    # 备份目标路径必须是 BACKUP_DIR/config（升级回调按 backup/config/ 恢复 app.env）。
+    check("O. 备份目标仍为 BACKUP_DIR/config",
+          '"${BACKUP_DIR}/config"' in upgrade_init)
+    # 备份失败不得中断升级（它在 fnOS 原地升级里只是保险），但必须留明确日志。
+    check("O. 备份失败不中断升级且记日志",
+          "警告: 配置备份失败" in upgrade_init)
+
 
 def main() -> int:
     print("== cmd app.env 引导冒烟测试 ==\n")
-    for name in ("lib.sh", "install_callback", "config_callback", "main"):
+    for name in ("lib.sh", "install_callback", "config_callback", "main",
+                 "upgrade_init", "upgrade_callback"):
         check(f"cmd/{name} 存在", (CMD / name).is_file())
 
     print()

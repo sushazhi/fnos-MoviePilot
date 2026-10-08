@@ -188,9 +188,20 @@ mp_secure_venv "${VENV_DIR}" || true
 
 # 重启服务使新版本代码生效。幂等：应用未运行时 start，运行中则 restart。
 # 若不重启，新版本要等到用户下次手动启停才生效。
+#
+# MP_SKIP_UPDATE=1：装包升级路径**必须**跳过启动前的联网更新检查。
+#   理由：这一刻程序目录刚被整包替换，version.py 就是包里那份，远端查询的结论
+#   注定是"已是最新"，纯属白等。而这条检查是四级降级 + 120s 整体预算
+#   （mp_updater.DISCOVERY_BUDGET），在 api.github.com 直连不通的受限网络里
+#   不会快速失败，而要一级级走完 API(15s) → 网页 → atom → 分支 raw，算上
+#   --resources 的第二遍，一次升级能白烧一两分钟 —— 这正是"应用中心装包
+#   更新很久"里最没价值的一段。
+#   跳过不影响正确性：cmd/main 的 repair_resources 仍在（纯本地资源对位、
+#   不联网），包内代码与资源本身就是这次升级要生效的版本；下次正常重启
+#   （不带该变量）或手动 `cmd/main update` 仍会照常联网检查。
 if [ -x "${TRIM_APPDEST}/cmd/main" ]; then
-    log "重启应用使新版本生效 ..."
-    "${TRIM_APPDEST}/cmd/main" restart >> "${TRIM_PKGVAR}/upgrade.log" 2>&1 \
+    log "重启应用使新版本生效（装包升级：跳过启动前联网检查）..."
+    MP_SKIP_UPDATE=1 "${TRIM_APPDEST}/cmd/main" restart >> "${TRIM_PKGVAR}/upgrade.log" 2>&1 \
         || log "警告: 应用重启失败，请手动启动应用"
 fi
 
