@@ -65,6 +65,7 @@ api.github.com 一律直连，不走加速（镜像对它的支持参差不齐�
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import html
 import json
@@ -209,6 +210,8 @@ EXIT_RESOURCE_UPDATED = 11
 
 MAX_FAILURES = 2          # 同一版本连续失败次数上限，超过就跳过（避免每次重启都重下一遍坏包）
 KEEP_BACKUPS = 2          # 保留的备份代数
+# 资源版本探测失败时，最多回显多少行子进程输出（traceback 通常在最后几行）。
+PROBE_OUTPUT_LINES = 20
 
 
 class UpdateError(RuntimeError):
@@ -1091,19 +1094,12 @@ def verify_site_resources(mp_src: Path) -> None:
             f"站点资源目录缺少 {wanted_index}"
             + (f"（现有旧版索引: {', '.join(present)}）" if present else "")
             + f": {res_dir}")
-    ver = f"{sys.version_info.major}{sys.version_info.minor}"
-    machine = platform.machine().lower()
-    if machine in ("arm64", "aarch64"):
-        machine = "aarch64"
-    elif machine in ("x86_64", "amd64"):
-        machine = "x86_64"
-    wanted = []
-    if os.name == "posix" and sys.platform != "darwin":
-        wanted.append(f"sites.cpython-{ver}-{machine}-linux-gnu.so")
-    elif sys.platform == "darwin":
-        wanted.append(f"sites.cpython-{ver}-darwin.so")
-    else:
-        wanted.append(f"sites.cp{ver}-win_amd64.pyd")
+    # 扩展名必须与 needed_resource_files() 用**同一套**推导。两处各写一遍
+    # 会静默漂移：needed_resource_files 走 resource_python_tag()（自由线程
+    # 构建会带 `t`，如 cpython-314t），而这里曾经硬编码 `ver = f"{major}{minor}"`
+    # —— 在 cp314t 解释器上就变成"下载 314t、校验要 314"，装完必报缺扩展并
+    # 白白回滚。统一从 wanted_resource_native_names() 取，这类漂移整体消失。
+    wanted = wanted_resource_native_names()
     if not any((res_dir / name).is_file() for name in wanted):
         raise UpdateError(
             f"站点资源目录缺少本机可用的 sites 扩展（需要 {' / '.join(wanted)}）: {res_dir}")
@@ -1161,20 +1157,31 @@ def resource_python_tag() -> str:
     return tag
 
 
+def wanted_resource_native_names() -> list:
+    """本机可用的 sites 原生扩展文件名（**唯一定义处**）。
+
+    "要下载哪个文件"（needed_resource_files）与"校验存在哪个文件"
+    （verify_site_resources）必须用同一份推导，否则两者会静默漂移：曾出现
+    needed_resource_files 走 resource_python_tag()（自由线程带 `t`）而校验侧
+    硬编码不带 `t`，在 cp314t 解释器上"装完即报缺扩展"并白白回滚。
+    """
+    tag = resource_python_tag()
+    ver = tag.replace("cp", "")
+    if os.name == "nt":
+        return [f"sites.cp{ver}-win_amd64.pyd"]
+    if sys.platform == "darwin":
+        return [f"sites.cpython-{ver}-darwin.so"]
+    return [f"sites.cpython-{ver}-{resource_machine_tag()}-linux-gnu.so"]
+
+
 def needed_resource_files() -> list:
     """本机需要的资源文件名（与上游 ResourceHelper._get_needed_files 同口径）。
 
     返回 [索引, 认证扩展]，顺序有意义：上游用 files[0] 取索引版本、files[-1] 取认证
     版本，保持一致可以让日志与上游逐字对照。
     """
-    tag = resource_python_tag()
-    ver = tag.replace("cp", "")
     index = f"user.sites.{RESOURCE_FLAG}.bin"
-    if os.name == "nt":
-        return [index, f"sites.cp{ver}-win_amd64.pyd"]
-    if sys.platform == "darwin":
-        return [index, f"sites.cpython-{ver}-darwin.so"]
-    return [index, f"sites.cpython-{ver}-{resource_machine_tag()}-linux-gnu.so"]
+    return [index] + wanted_resource_native_names()
 
 
 # 版本探测脚本：把两个版本号塞在一行带哨兵前缀的 JSON 里，避免被扩展在 import
@@ -1183,14 +1190,29 @@ def needed_resource_files() -> list:
 _RESOURCE_PROBE = (
     "import json\n"
     "from app.application.site.sites import SitesHelper\n"
+    # 只构造一次：sites 扩展里有 SiteSingleton（进程级单例）机制，
+    # `[str(SitesHelper().a), str(SitesHelper().b)]` 这种写法会在一个表达式里
+    # 构造两次，第二次可能因单例/非幂等初始化而抛错 —— 而 mp_resources 的
+    # 纯 import 检查不会有这个问题，于是表现为"能 import 但探针 rc=1"。
+    # 真机（fnOS arm64）上正是这个形态，所以这里刻意只实例化一次。
+    "_h = SitesHelper()\n"
     "print('__MP_RESOURCE_VERSIONS__' + json.dumps("
-    "[str(SitesHelper().auth_version), str(SitesHelper().indexer_version)]))\n"
+    "[str(_h.auth_version), str(_h.indexer_version)]))\n"
 )
 _RESOURCE_PROBE_MARK = "__MP_RESOURCE_VERSIONS__"
+# 探测判定结果。"probe" 为 None 表示**探测本身没能得出结论**（解释器跑不起来、
+# 子进程异常退出、没有哨兵行、stderr 被 locale 解不开……）。这与"扩展真的坏了"
+# 是两件事，调用方必须分开处理 —— 历史上两者被混为一谈，于是探针跑不起来的机器
+# 上资源更新永远失败，还报出一个从未验证过的原因（认证扩展不可导入）。
+ProbeResult = collections.namedtuple("ProbeResult", "versions output reason")
 
 
 def probe_local_resource_versions(cfg: Config):
-    """用后端解释器读出本机**实际加载**的资源版本；读不到返回 None。
+    """用后端解释器读出本机**实际加载**的资源版本。
+
+    返回 ProbeResult(versions, output, reason)：
+      versions  ("auth", "indexer")  探测成功
+                None                 探测没能得出结论（看 reason / output）
 
     为什么不直接信状态文件：fpk 重装会把 app/ 换回打包时的资源，而
     CONFIG_DIR/mp_update.json 是持久化的。只信状态文件的话，重装后状态里那个
@@ -1201,32 +1223,48 @@ def probe_local_resource_versions(cfg: Config):
     探测机制与 mp_resources.native_loadable 一致：真实解释器 + cwd=MP_SRC +
     PYTHONPATH=MP_SRC。sites 扩展在 import 期就要读 app.runtime 的配置，缺了
     这些路径必然失败，用桩模块是测不出来的。
+
+    ⚠️ 子进程的输出（含 traceback）**必须**带回给调用方：探测失败时那几行
+    stderr 是唯一能指出"到底哪一步失败"的证据。早期实现只记 rc 就把它丢了，
+    导致六种完全不同的失败形态（模块缺失 / import 抛错 / 构造函数抛错 /
+    属性抛错 / 属性不存在 / sys.exit(1)）在日志里长得一模一样，只能靠猜。
     """
     if not cfg.python:
-        return None
+        return ProbeResult(None, "", "未配置 APP_PYTHON")
     env = dict(os.environ)
+    # PYTHONPATH / CONFIG_DIR 一律硬赋值：探测子进程必须与后端看到同一套路径。
+    # 用 setdefault 的话，更新器自己环境里那个"已经存在的"值会赢，而它未必是
+    # 后端真正用的那个（两者都从 app.env 推导，但推导路径不同）。
     env["PYTHONPATH"] = str(cfg.mp_src)
-    env.setdefault("MP_SRC", str(cfg.mp_src))
+    env["MP_SRC"] = str(cfg.mp_src)
     if cfg.config_dir:
-        env.setdefault("CONFIG_DIR", str(cfg.config_dir))
+        env["CONFIG_DIR"] = str(cfg.config_dir)
     try:
         proc = subprocess.run([cfg.python, "-c", _RESOURCE_PROBE],
                               cwd=str(cfg.mp_src), env=env, timeout=60,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              text=True)
+                              text=True, errors="replace")
     except Exception as e:  # noqa: BLE001 - 探测失败不是错误，只是没有权威版本
+        reason = f"探测进程未能运行: {e}"
         log(f"    站点资源版本探测失败: {e}")
-        return None
-    for line in (proc.stdout or "").splitlines():
+        return ProbeResult(None, "", reason)
+    out = proc.stdout or ""
+    for line in out.splitlines():
         if not line.startswith(_RESOURCE_PROBE_MARK):
             continue
         try:
             auth, indexer = json.loads(line[len(_RESOURCE_PROBE_MARK):])
         except (ValueError, TypeError):
             continue
-        return str(auth or "0"), str(indexer or "0")
+        return ProbeResult((str(auth or "0"), str(indexer or "0")), out, "")
+    reason = f"探测无结果（rc={proc.returncode}）"
     log(f"    站点资源版本探测无结果（rc={proc.returncode}），改用状态文件")
-    return None
+    # 把子进程输出打出来 —— 这正是过去被丢掉的那段。
+    for line in out.strip().splitlines()[-PROBE_OUTPUT_LINES:]:
+        log(f"      | {line}")
+    if not out.strip():
+        log("      | （子进程没有任何输出）")
+    return ProbeResult(None, out, reason)
 
 
 def resource_update_info(cfg: Config, local_versions: dict) -> dict:
@@ -1336,10 +1374,10 @@ def rollback_resources(moves: list) -> None:
 
 def resource_versions_now(cfg: Config, state: dict) -> dict:
     """当前站点资源版本：优先真实探测，其次状态文件记录。"""
-    probed = probe_local_resource_versions(cfg)
-    if probed:
-        log(f"    本机站点资源版本：认证 {probed[0]} / 索引 {probed[1]}")
-        return {"auth": probed[0], "indexer": probed[1]}
+    result = probe_local_resource_versions(cfg)
+    if result.versions:
+        log(f"    本机站点资源版本：认证 {result.versions[0]} / 索引 {result.versions[1]}")
+        return {"auth": result.versions[0], "indexer": result.versions[1]}
     recorded = dict(state.get("resource_versions") or {})
     log(f"    使用状态文件记录的站点资源版本：{recorded or '未知'}")
     return recorded
@@ -1392,23 +1430,51 @@ def do_resources(cfg: Config, args) -> int:
         install_resource_files(cfg, info["files"], work, backup_dir, moves)
         # 安装后必须在回滚窗口内确认"真的生效"，只看文件在位是不够的：
         # 扩展与索引不匹配时文件同样齐全，但站点列表是空的。
+        #
+        # 但"确认"分两层，必须分开判：
+        #   1) verify_site_resources —— 文件名/ABI 层面。这是**确定性**检查，
+        #      不通过就一定有问题，必须回滚。
+        #   2) probe（真实 import + 读版本）—— 这是**行为性**检查，但它依赖
+        #      子进程能否跑起来。探针跑不起来 ≠ 扩展坏了：探针失败时它自己
+        #      都不知道是哪一步失败（见 probe_local_resource_versions）。
+        #
+        # 历史缺陷：这里用 `if local and not verified: raise` 把两件事混同了。
+        # `local` 是探针失败后退回状态文件的值，非空就"武装"了这个守卫；而守卫
+        # 又要求探针成功才能放行 —— 于是探针跑不起来的机器上，资源更新**永远**
+        # 失败，并在每次启动重复，直到 MAX_FAILURES 把该版本静默跳过。更糟的是
+        # 它报出的原因是"认证扩展不可导入"，而代码从未验证过这件事。
         verify_site_resources(cfg.mp_src)
-        verified = probe_local_resource_versions(cfg)
-        if local and not verified:
-            raise UpdateError("站点资源安装后无法加载（认证扩展不可导入）")
+        probe = probe_local_resource_versions(cfg)
+        verified = probe.versions
         if verified:
             for kind, got in (("auth", verified[0]), ("indexer", verified[1])):
                 want = info["latest"].get(kind)
                 if want and version_key(got) < version_key(want):
                     raise UpdateError(
                         f"站点资源安装后版本不符：{kind} 期望 {want}，实际 {got}")
+        elif local:
+            # 探针这次读不到版本，但**装之前**它同样读不到（local 就是退回状态
+            # 文件的结果）。两边都读不到，说明这台机器上探针本来就用不了，不能
+            # 据此判定"装坏了" —— 文件名检查已经过了，安装结果可信。
+            log("    警告: 安装后仍无法探测资源版本，但安装前同样探测不到，"
+                "本次不做版本校验（文件名检查已通过）")
+            log(f"    探测未得出结论的原因: {probe.reason or '未知'}")
+        else:
+            # local 为空 = 状态文件也没有记录，等于完全没有权威基线。
+            # 此时**不能**默默接受：可能装进了一份坏扩展，而文件在位、
+            # 文件名正确 —— 正是历史上"更新成功但起不来"的形态。
+            raise UpdateError(
+                f"站点资源安装后无法加载，且无状态文件基线可对照（{probe.reason or '探测无结论'}）")
     except Exception as e:  # noqa: BLE001 - 任何异常都要整批回滚
         log(f"错误: 站点资源更新失败: {e}")
         rollback_resources(moves)
         failures = state.get("resource_failures") or {}
         failures[key] = int(failures.get(key, 0)) + 1
+        # 冷却与上面的 UpdateError 分支（1369）保持同口径：失败后只等
+        # RETRY_AFTER_FAILURE 再试，而不是整个 interval。否则一次可恢复的失败
+        # （比如启动窗口内的探测抖动）会让资源检查停摆一整个周期。
         state.update({"resource_failures": failures, "resource_last_error": str(e),
-                      "resource_checked_at": now})
+                      "resource_checked_at": now - max(interval - RETRY_AFTER_FAILURE, 0)})
         save_state(cfg, state)
         return EXIT_FAILED
     finally:
@@ -1418,9 +1484,14 @@ def do_resources(cfg: Config, args) -> int:
     if verified:
         applied.update({"auth": verified[0], "indexer": verified[1]})
     else:
+        # 只有走到这里才允许记录未经验证的版本，且必须标记出来：
+        # 直接把 info["latest"] 当成"已安装版本"会让下一次检查误判"已最新"，
+        # 从而永远不再重试这份没验证成功的资源。
         applied.update(info["latest"])
+        log("    注意: 本次未能验证资源版本，已按清单版本记账但标记为未验证")
     state.update({"resource_versions": applied, "resource_checked_at": now,
-                  "resource_last_error": None, "resource_failures": {}})
+                  "resource_last_error": None, "resource_failures": {},
+                  "resource_versions_verified": bool(verified)})
     save_state(cfg, state)
     prune_backups(cfg.resource_backup_root)
     log(f"==> 站点资源更新完成：{label}")

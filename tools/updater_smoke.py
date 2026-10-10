@@ -677,10 +677,13 @@ def scenario_k():
 
     # 版本探测打桩：按索引文件内容判断"装了没有"，模拟真实扩展的 auth_version/
     # indexer_version（本机是 Windows/cp312，真加载 .pyd 不现实）。
+    #
+    # 返回值必须是 ProbeResult —— 探测结果与"探测本身能否得出结论"是两件事，
+    # 调用方靠 .versions 为 None 区分（历史缺陷正是把两者混同）。
     def fake_probe(c):
         if (res_dir / "user.sites.v3.bin").read_text(encoding="utf-8") == "NEW-INDEX":
-            return ("3.0.4", "3.0.17")
-        return ("3.0.3", "3.0.12")
+            return mod.ProbeResult(("3.0.4", "3.0.17"), "", "")
+        return mod.ProbeResult(("3.0.3", "3.0.12"), "", "")
 
     downloaded = []
 
@@ -765,7 +768,7 @@ def scenario_k():
     # K16 下载失败 → 不改动现有资源（下载全成功才动运行目录）
     mod.fetch_text = lambda url, proxies, timeout, deadline=None, limit=0: (url, manifest)
     mod.download_file = lambda *a, **k: False
-    mod.probe_local_resource_versions = lambda c: ("3.0.3", "3.0.12")
+    mod.probe_local_resource_versions = lambda c: mod.ProbeResult(("3.0.3", "3.0.12"), "", "")
     rc = mod.do_resources(cfg, Namespace(force=True))
     check("K16 下载失败时退出码=1", rc == mod.EXIT_FAILED, f"rc={rc}")
     check("K17 下载失败后资源原样保留",
@@ -855,9 +858,176 @@ def scenario_k():
           (res_dir / native_name).read_text(encoding="utf-8") == "PREV-NATIVE",
           (res_dir / native_name).read_text(encoding="utf-8"))
 
+    # ---------------------------------------------------------------------
+    # K27-K30 回归：探测不可用 ≠ 扩展损坏
+    #
+    # 真机故障（2026-10-09，fnOS arm64）：应用启用的启动窗口内，探测子进程以
+    # rc=1 退出且不留哨兵行。旧代码把"探测没得出结论"当成"扩展不可导入"：
+    #     if local and not verified: raise UpdateError("...认证扩展不可导入")
+    # 而 local 是探测失败后退回状态文件的值，非空即"武装"了守卫 —— 于是这台
+    # 机器上资源更新**永远**失败，每次启动重复，直到 MAX_FAILURES 静默跳过。
+    # 下面用真实的 do_resources 覆盖这两个方向。
+    # ---------------------------------------------------------------------
+    def _probe_returns(versions):
+        def _p(c):
+            if versions:
+                return mod.ProbeResult(versions, "", "")
+            return mod.ProbeResult(None, "Traceback (most recent call last):\n  ...\n"
+                                         "ModuleNotFoundError: simulated probe failure",
+                                   "探测无结果（rc=1）")
+        return _p
+
+    state_file = cfgdir / "mp_update.json"
+
+    def _reset_failures(versions=None):
+        """K22 已把失败计数顶到 MAX_FAILURES；--force 只绕过冷却，**不**绕过
+        失败上限（见 do_resources 的 `not force and ...MAX_FAILURES` 判断），
+        所以这里必须显式清掉计数，否则用例测到的是"跳过"而不是目标分支。
+
+        基线版本必须**比清单旧**（清单默认 index 3.0.17 / auth 3.0.4），
+        否则 resource_update_info 会正确地判定"已最新"而不进安装分支，
+        用例就测不到目标逻辑。
+        """
+        data = {"resource_failures": {},
+                "resource_versions": versions if versions is not None
+                else {"auth": "3.0.3", "indexer": "3.0.12"}}
+        state_file.write_text(json.dumps(data), encoding="utf-8")
+
+    # K27 探测不可用 + 状态文件有基线 → 不得回滚，必须接受安装结果。
+    # 这正是真机形态：装的文件通过了文件名检查，而探测在装前装后都拿不到版本。
+    (res_dir / "user.sites.v3.bin").write_text("PREV-INDEX", encoding="utf-8")
+    (res_dir / native_name).write_text("PREV-NATIVE", encoding="utf-8")
+    _reset_failures()
+    mod.fetch_text = lambda url, proxies, timeout, deadline=None, limit=0: (url, manifest)
+    mod.download_file = fake_download
+    mod.verify_site_resources = lambda src: None
+    mod.probe_local_resource_versions = _probe_returns(None)
+    rc = mod.do_resources(mod.Config(), Namespace(force=True))
+    check("K27 探测不可用但装前同样不可用 → 接受安装（不再误判扩展损坏）",
+          rc == mod.EXIT_RESOURCE_UPDATED, f"rc={rc}")
+    check("K28 安装结果被保留（索引已换成新的）",
+          (res_dir / "user.sites.v3.bin").read_text(encoding="utf-8") == "NEW-INDEX",
+          (res_dir / "user.sites.v3.bin").read_text(encoding="utf-8"))
+    st = json.loads(state_file.read_text(encoding="utf-8"))
+    check("K28b 未验证的记账被显式标记", st.get("resource_versions_verified") is False,
+          str(st.get("resource_versions_verified")))
+
+    # K29 探测不可用 + **没有任何基线** → 必须仍然回滚。
+    # 这是相反方向的危险：基线为空时旧代码静默放行，可能装进一份坏扩展，
+    # 而文件名检查根本发现不了（"更新成功但起不来"的经典形态）。
+    (res_dir / "user.sites.v3.bin").write_text("PREV-INDEX", encoding="utf-8")
+    (res_dir / native_name).write_text("PREV-NATIVE", encoding="utf-8")
+    _reset_failures(versions={})             # 状态文件存在但没有 resource_versions
+    rc = mod.do_resources(mod.Config(), Namespace(force=True))
+    check("K29 无基线且探测不可用 → 回滚（不放过未验证的安装）",
+          rc == mod.EXIT_FAILED, f"rc={rc}")
+    check("K30 回滚后索引恢复原样",
+          (res_dir / "user.sites.v3.bin").read_text(encoding="utf-8") == "PREV-INDEX",
+          (res_dir / "user.sites.v3.bin").read_text(encoding="utf-8"))
+
+    # K31 失败后的冷却必须与网络失败分支同口径（只等 RETRY_AFTER_FAILURE），
+    # 否则一次可恢复的失败会让资源检查停摆一整个 interval。
+    st = json.loads(state_file.read_text(encoding="utf-8"))
+    interval = max(mod.Config().get_int("MP_UPDATE_INTERVAL", 21600), 0)
+    expected = st.get("resource_checked_at", 0)
+    check("K31 失败后按 RETRY_AFTER_FAILURE 冷却而非整个周期",
+          interval > 0 and expected > 0 and
+          (time.time() - expected) >= max(interval - mod.RETRY_AFTER_FAILURE, 0) - 5,
+          f"interval={interval} checked_at_delta={time.time() - expected:.0f}")
+
+    # K32/K33 要跑**真实**的探针函数，所以必须先把前面所有打桩还原掉。
+    # 这里踩过一次：还原语句原本在外层末尾（本块之后），于是本块调用到的仍是
+    # K29 留下的 `_probe_returns(None)` 桩，日志自然为空、断言无意义。
     mod.fetch_text, mod.download_file = real_fetch, real_download
     mod.probe_local_resource_versions = real_probe
     mod.verify_site_resources = real_verify
+
+    # K32 真机故障的可诊断性：探测失败时**必须**把子进程输出（含 traceback）
+    # 打出来。真机日志里只有 "rc=1"，六种失败形态完全同形，只能靠猜 —— 那正是
+    # 这次排查绕远路的根因。这里跑**真实**的 probe 函数（不打桩），让子进程真的
+    # 失败一次，断言 traceback 与失败步骤都出现在日志里。
+    import tempfile as _tf
+    probe_root = Path(_tf.mkdtemp(prefix="mp-probe-smoke-"))
+    try:
+        _mp = probe_root / "mp"
+        _site = _mp / "app" / "application" / "site"
+        _site.mkdir(parents=True)
+        (_mp / "app" / "__init__.py").write_text("", encoding="utf-8")
+        (_mp / "app" / "application" / "__init__.py").write_text("", encoding="utf-8")
+        (_site / "__init__.py").write_text("", encoding="utf-8")
+        # 导入能过，构造抛错 —— 正是真机形态（mp_resources 的纯 import 成功，
+        # 探针的 SitesHelper() 失败）。
+        (_site / "sites.py").write_text(
+            "class SitesHelper:\n"
+            "    def __init__(self):\n"
+            "        raise RuntimeError('simulated ctor failure')\n", encoding="utf-8")
+        _saved = {k: os.environ.get(k) for k in ("MP_SRC", "CONFIG_DIR", "APP_PYTHON")}
+        os.environ.update({"MP_SRC": str(_mp), "CONFIG_DIR": str(probe_root / "cfg"),
+                           "APP_PYTHON": sys.executable})
+        (probe_root / "cfg").mkdir(parents=True, exist_ok=True)
+        # 必须**自己构造** Config 并指向本用例的树：scenario K 早先已把 MP_SRC
+        # 设成它自己的沙箱，而那个沙箱里的 sites 只有 10 字节的假 .pyd。若依赖
+        # 环境变量，探针就会跑在错误的树上，测到的是另一个错误（这里踩过一次）。
+        _pcfg = mod.Config()
+        _pcfg.mp_src = _mp
+        _pcfg.config_dir = probe_root / "cfg"
+        _pcfg.python = sys.executable
+        _logs = []
+        _real_log_fn = mod.log
+        # 用模块级变量而不是闭包捕获日志：probe 内部通过模块全局 `log` 输出，
+        # 而 scenario K 前面若干步会把 mod.log 换成各种包装，闭包容易捕到空列表。
+        # 这里直接把 mod.log 换成"既写真实日志、又追加到 _logs"的实现。
+        def _capture(m, _sink=_logs, _real=_real_log_fn):
+            _sink.append(str(m))
+            return _real(m)
+        mod.log = _capture
+        try:
+            _res = mod.probe_local_resource_versions(_pcfg)
+        finally:
+            mod.log = _real_log_fn
+        _text = "\n".join(_logs)
+        # 诊断信息写进断言 detail，避免"失败但看不出为什么"。
+        _diag = (f"logs={len(_logs)} outlen={len(_res.output or '')} "
+                 f"reason={_res.reason!r}")
+        check("K32 探测失败时返回 None 且给出原因", _res.versions is None and bool(_res.reason),
+              f"versions={_res.versions} reason={_res.reason!r}")
+        check("K33 子进程 traceback 被记入日志（真机缺的就是这段）",
+              "Traceback" in _text and "simulated ctor failure" in _text,
+              _diag + " || " + _text[-200:])
+
+        # K34 探针必须**只构造一次** SitesHelper。
+        # sites 扩展里有 SiteSingleton（进程级单例），而旧探针写成
+        #     [str(SitesHelper().auth_version), str(SitesHelper().indexer_version)]
+        # 在一个表达式里构造两次 —— 第二次可能因单例/非幂等初始化抛错，于是
+        # 表现为"纯 import 成功、探针 rc=1"，与真机症状完全同形。
+        # 这里把 tests 目录换成"第二次构造必抛错"的单例式实现来固定这个契约。
+        (_site / "sites.py").write_text(
+            "_made = []\n"
+            "class SitesHelper:\n"
+            "    def __init__(self):\n"
+            "        if _made:\n"
+            "            raise RuntimeError('singleton already constructed')\n"
+            "        _made.append(1)\n"
+            "        self.auth_version = '3.0.4'\n"
+            "        self.indexer_version = '3.0.18'\n", encoding="utf-8")
+        _logs2 = []
+        _real_log_fn2 = mod.log
+        mod.log = lambda m, _s=_logs2, _r=_real_log_fn2: (_s.append(str(m)), _r(m))
+        try:
+            _res2 = mod.probe_local_resource_versions(_pcfg)
+        finally:
+            mod.log = _real_log_fn2
+        check("K34 单例式扩展下探针只构造一次并成功（旧写法在此 rc=1）",
+              _res2.versions == ("3.0.4", "3.0.18"),
+              f"versions={_res2.versions} reason={_res2.reason!r}")
+
+        for k, v in _saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    finally:
+        shutil.rmtree(probe_root, ignore_errors=True)
 
 
 if __name__ == "__main__":
