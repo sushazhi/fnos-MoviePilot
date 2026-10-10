@@ -1,5 +1,5 @@
 appname               = moviepilot
-version               = 3.1.1
+version               = 3.1.3
 display_name          = MoviePilot
 desc                  = <b>NAS 媒体库自动化管理工具</b>，支持订阅、搜索、下载、媒体整理与刮削、媒体库刷新及消息通知等核心自动化流程。<br><br>🎬 <b>原生应用：</b>内置 Python 后端与 Web 前端，前后端运行于本地，通过 fnOS 统一网关嵌入桌面访问。
 
@@ -31,4 +31,4 @@ desktop_applaunchname = moviepilot.Application
 install_dep_apps      = nodejs_v24
 
 # 更新日志
-changelog             = v3.1.1<br>1.跟进上游 MoviePilot v3.1.1<br>2.本条目由 GitHub Actions 定时检查上游后自动生成
+changelog             = v3.1.3<br>1.跟进上游 MoviePilot v3.1.3：构建 pin 与 manifest 版本同步更新，包名版本与上游 tag 一一对应<br>2.上游源码零改动原样集成，仅做 fnOS 打包适配（生命周期脚本、统一网关、桌面入口）<br>3.自带 CPython 3.14.7 运行时与全部依赖，安装时无需联网<br>4.本条目由 GitHub Actions 定时检查上游后自动生成
