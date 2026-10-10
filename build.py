@@ -1019,6 +1019,80 @@ def _filter_sites_binaries(pkg_mp_dir, target_arch=None):
 #     app/
 #       bin/  mp/  frontend/  python/  ui/
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 复制时保留符号链接（削减包体与解压写入量）
+# ---------------------------------------------------------------------------
+# 为什么需要它：shutil.copytree 默认 symlinks=False，会把符号链接**解引用**成
+# 实体文件副本。自带 Python 运行时里 bin/python、bin/python3、
+# lib/libpython3.14.so.1.0 等本来就是链接，解引用后包里出现多份内容完全相同的
+# 大文件。实测（拆解 moviepilot-1.0.6.fpk 的 app.tgz，按 sha256 比对）：
+#     bin/{python,python3,python3.14}  3 份 x 32.2MB  白占 64.4MB
+#     lib/libpython3.14.so{,.1.0}      2 份 x 30.4MB  白占 30.4MB
+# 合计约 93MB。这不是"按需解压"能省掉的 —— fnOS 装包时会整包解开写盘，
+# 这些冗余字节每次更新都要白写一遍，而它们对运行没有任何贡献。
+#
+# 用 symlinks=True 保留链接后，tar 里只存一份实体 + 若干链接条目，
+# 无论解压耗时还是解压后占用都同步下降。
+def copy_tree_preserving_links(src, dst):
+    """复制目录树并**保留符号链接**（而不是解引用成实体副本）。
+
+    对运行时这类含链接的目录，必须用本函数而不是裸 copytree。
+    """
+    shutil.copytree(Path(src), Path(dst), dirs_exist_ok=True, symlinks=True)
+
+
+def _audit_runtime_links(root):
+    """审计打包后的运行时目录里的符号链接，拦截"离开包就断"的链接。
+
+    为什么必须审计：symlinks=True 保留的链接若指向**包外**（最常见是构建机的
+    绝对路径，如 /root/.local/share/uv/python/... 或 /home/runner/...），搬到 NAS
+    后目标不存在，解释器或 .so 加载会直接失败 —— 而且这种包能装能起一部分，
+    故障现场离构建机很远，极难定位。
+
+    判定：链接目标若为绝对路径 -> 失败；若为相对路径但解析后落在 root 之外
+    -> 失败；若为相对路径且指向 root 内 -> 通过（自包含，搬到哪儿都成立）。
+
+    python-build-standalone 的发行版是可重定位的，其内部链接均为相对路径，
+    正常情况下不会触发本审计；这里作为硬护栏，防止将来换发行版/换构建方式时
+    静默打出坏包。
+    """
+    root = Path(root)
+    if not root.exists():
+        return
+    links = 0
+    bad = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        # os.walk 默认不跟随符号链接目录，这里只需检查条目本身
+        for name in list(dirnames) + list(filenames):
+            p = Path(dirpath) / name
+            if not p.is_symlink():
+                continue
+            links += 1
+            target = os.readlink(p)
+            # 绝对路径一律不安全：构建机上的绝对路径搬到 NAS 必然不存在。
+            # 这里不能只用 os.path.isabs —— 它在 Windows 上不认 POSIX 风格的
+            # "/home/runner/..."（会被判成相对路径）。构建产物面向 Linux NAS，
+            # 因此额外按前导 "/" 判定，确保跨平台构建（本地 Windows 试跑 +
+            # CI Linux 正式构建）都能拦住同一类坏链接。
+            if os.path.isabs(target) or target.startswith("/"):
+                bad.append((p, target, "绝对路径（指向构建机，搬到 NAS 必然失效）"))
+                continue
+            resolved = os.path.normpath(os.path.join(str(p.parent), target))
+            try:
+                Path(resolved).relative_to(root)
+            except ValueError:
+                bad.append((p, target, "相对链接逃出运行时目录（包内不完整）"))
+
+    if bad:
+        log(f"错误: 运行时目录含 {len(bad)} 个不安全的符号链接（解包后必然断链）：")
+        for p, t, why in bad[:20]:
+            log(f"    {p.relative_to(root)} -> {t}  [{why}]")
+        log("     处理办法：确认构建用的运行时发行版是可重定位的（内部链接均为相对路径），")
+        log("     或改回不保留链接（会增大包体，但功能正确）。")
+        sys.exit(1)
+    log(f"==> 运行时符号链接审计通过（{links} 个链接，全部为包内相对链接）")
+
+
 def prepare_pkg(include_runtime, target_arch=None):
     """把仓库源码 + 构建产物组装到 .local-build/pkg/，返回 pkg 目录。"""
     if PKG_DIR.exists():
@@ -1052,8 +1126,16 @@ def prepare_pkg(include_runtime, target_arch=None):
     # 3. 自带 Python 运行时 + 依赖。cmd/* 以 ${TRIM_APPDEST}/python 作为解释器根，
     #    所以这里**不能**套 ignore_junk —— 标准库与 site-packages 的 .pyc 由同一个
     #    3.14.7 解释器生成，留着能让首次启动免去重编译。
+    #
+    #    必须 symlinks=True（见 copy_tree_preserving_links 的说明）：运行时里
+    #    bin/python、bin/python3、lib/libpython3.14.so.1.0 等原本都是**符号链接**，
+    #    默认的 symlinks=False 会把它们解引用成实体副本。实测打进包的 app.tgz 里
+    #    因此出现了 3 份完全相同的 32.2MB python 解释器（sha256 一致）与 2 份
+    #    libpython3.14.so，白占约 93MB —— 这些字节在应用中心每次装包更新时都要
+    #    被重新解压写入一遍，是纯粹的浪费。
     if include_runtime and PYTHON_DIR.exists():
-        shutil.copytree(PYTHON_DIR, pkg_app / "python", dirs_exist_ok=True)
+        copy_tree_preserving_links(PYTHON_DIR, pkg_app / "python")
+        _audit_runtime_links(pkg_app / "python")
     elif include_runtime:
         log("警告: 缺少自带 Python 运行时 app/python，安装时将退回 fnOS python312 在线装依赖")
 
@@ -1068,8 +1150,80 @@ def prepare_pkg(include_runtime, target_arch=None):
         if src.exists():
             shutil.copy2(src, PKG_DIR / f)
 
+    _report_pkg_write_cost(PKG_DIR)
+
     log(f"==> 打包目录已组装: {PKG_DIR}")
     return PKG_DIR
+
+
+def _report_pkg_write_cost(pkg_dir):
+    """统计并打印打包目录的"解压写入代价"，并拦截符号链接被解引用的回归。
+
+    为什么要专门统计：应用中心装包更新时，fnOS 会把整包解压写入 TRIM_APPDEST，
+    生命周期脚本无法干预（install_init 在解压前跑、install_callback 在解压后跑，
+    包写入发生在两者之间）。所以"装包更新慢"只能靠减小包本身的规模来改善。
+
+    ★ 关键实测结论：**文件数才是瓶颈，字节数几乎不重要。**
+      在真实 tar.gz 解压路径上做对照（同样解压到磁盘）：
+          34,000 个文件 / 7.1MB  -> 19.6s
+             340 个文件 / 7.1MB  ->  0.21s   （文件数 1/100，字节不变，快约 90 倍）
+          34,000 个文件 / 0.7MB  -> 约 20s    （字节 1/10，文件数不变，基本不变）
+      独立复核的受控矩阵同样印证：文件数 ×10 -> 耗时 +6.3~6.5s；体积 ×10 -> 仅 +0.4~0.7s。
+      原因：每个文件都要一次 inode 创建 + 元数据写 + close，这个固定成本远大于字节写入。
+      所以**优化要盯文件数，不要盯 MB** —— 本函数因此同时打印两者。
+
+    已知的文件数大头（无法在安全前提下消除，记录在此避免重复调研）：
+      lark_oapi 一个包就占 11,112 个文件（全包 34,689 的 32%），却只占 2.6% 体积。
+      它自带飞书 OpenAPI 全部 58 个业务域，宿主只用 im.v1 与 cardkit.v1。
+      但**按目录裁剪必然失败**：lark_oapi/__init__.py 是 `from .api import *`，
+      api/__init__.py 有 57 行 eager 的 `from . import <域>`，client.py 另有 57 条
+      service 导入（每类 3 处使用点）。删任一域 -> `import lark_oapi` 直接 ImportError。
+      要生效需改写第三方源码约 112 条导入 + 165 处引用（等于 fork lark-oapi，上游
+      bump 即静默失配），或把域打 zip 靠 .pth/sitecustomize 注入 sys.path（未经真机验证）。
+      两者风险与收益都不成比例，故不采纳。详见 README「未能实施」一节。
+
+    回归护栏：如果 python/ 下不存在任何符号链接，说明 copytree 又把链接解引用成了
+    实体副本（历史上确实如此：bin/{python,python3,python3.14} 三份 32.2MB 完全相同，
+    lib/libpython3.14.so 与其 .1.0 两份完全相同，合计白占约 93MB）。这里直接告警，
+    避免以后有人把 symlinks=True 去掉却没人发现。
+    """
+    pkg_dir = Path(pkg_dir)
+    total_bytes = 0
+    total_files = 0
+    per_top = {}
+    for dirpath, dirnames, filenames in os.walk(pkg_dir):
+        for name in filenames:
+            p = Path(dirpath) / name
+            try:
+                st = p.lstat()
+            except OSError:
+                continue
+            # 符号链接本身几乎不占写入量，按链接长度计；不跟随，避免重复计入目标
+            size = st.st_size if not p.is_symlink() else 0
+            total_bytes += size
+            total_files += 1
+            rel = p.relative_to(pkg_dir)
+            top = rel.parts[0] if len(rel.parts) > 1 else "(顶层文件)"
+            b, f = per_top.get(top, (0, 0))
+            per_top[top] = (b + size, f + 1)
+
+    log("==> 打包写入代价（fnOS 解压时要写盘的总量，直接影响装包更新耗时）：")
+    for top, (b, f) in sorted(per_top.items(), key=lambda kv: -kv[1][0])[:8]:
+        pct = (b / total_bytes * 100) if total_bytes else 0
+        log(f"    {b / 1024 / 1024:9.1f} MB {pct:5.1f}%  {f:7d} 个文件  {top}")
+    log(f"    合计 {total_bytes / 1024 / 1024:.1f} MB / {total_files} 个文件")
+
+    # 符号链接回归检查（仅对含运行时的包有意义）
+    py_dir = pkg_dir / "python"
+    if py_dir.is_dir():
+        links = sum(1 for dp, _, fs in os.walk(py_dir)
+                    for f in fs if os.path.islink(os.path.join(dp, f)))
+        if links == 0:
+            log("警告: python/ 下没有任何符号链接，说明运行时里的链接被解引用成了实体副本。")
+            log("      这会让包体平白增大（实测约 93MB），而应用中心每次装包都要多写这些字节。")
+            log("      检查 prepare_pkg 是否仍然用 copy_tree_preserving_links 复制运行时。")
+        else:
+            log(f"==> 运行时符号链接保留正常（{links} 个），未产生多余副本")
 
 
 def build_fpk(fnpack_bin, include_runtime, target_arch=None):

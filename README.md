@@ -116,6 +116,7 @@ MoviePilot V3 的 `pyproject.toml` 声明 `requires-python >= 3.14`，而 fnOS �
 │   ├── resources_smoke.py      # 站点资源修复/回填的离线冒烟测试
 │   ├── supervisor_smoke.py     # 进程托管（失败计数/退避/重启）的离线冒烟测试
 │   ├── cmd_env_smoke.py        # 生命周期脚本 app.env 生成逻辑的离线冒烟测试（需 bash）
+│   ├── pkgsize_smoke.py        # 打包优化（符号链接保留、链接审计、写入代价统计）的冒烟测试
 │   └── polyfill_smoke.py       # 代理注入的 JS polyfill 冒烟测试（需 node，缺失则 SKIP）
 ├── .github/workflows/
 │   ├── check-upstream.yml      # 每周二检查上游 → 改 pin/manifest → 打 tag → 派发构建
@@ -374,18 +375,86 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 > 注意：通过 fpk 重新安装/升级应用时，应用目录会被整包替换，自更新的内容随之回到
 > 安装包自带的版本（这是预期行为，也让"应用包升级"始终是可靠的回退路径）。
 
-### 应用中心装包升级的耗时构成（以及为什么不慢）
+### 应用中心装包升级的耗时构成
 
-`upgrade` 由 `upgrade_init` → 整包替换 → `upgrade_callback` 三段组成，其中两处做过
-专门优化，避免把"装个包"拖成几分钟：
+`upgrade` 由 `upgrade_init` → 整包替换 → `upgrade_callback` 三段组成。
 
 | 阶段 | 内容 | 说明 |
 |------|------|------|
 | `upgrade_init` | 停服务 + 备份 config | 停服务最多等 30s（后端要收敛在途任务）；备份按**硬链接 → reflink → 全量拷贝**降级，同文件系统下近乎瞬时 |
-| 整包替换 | fnOS 解压 fpk 覆盖 `TRIM_APPDEST` | 体积主要来自自带的 CPython 3.14 + 全部依赖（数百 MB），这是"安装时零联网"的代价 |
+| 整包替换 | fnOS 解压 fpk 覆盖 `TRIM_APPDEST` | **耗时主项**，且生命周期脚本无法干预（见下） |
 | `upgrade_callback` | 运行时自检 + 数据库迁移 + 重启 | 自带运行时时**跳过 pip**（只做秒级 import 自检）；重启带 `MP_SKIP_UPDATE=1` |
 
-两个关键优化点：
+#### 关键结论：解压耗时的瓶颈是**文件数**，不是体积
+
+这一点反直觉，但实测方向一致。在真实 tar.gz 解压路径上做对照（同样解压到磁盘）：
+
+| 对照 | 耗时 |
+|------|------|
+| 34,000 个文件 / 7.1 MB | **19.6 s** |
+| 340 个文件 / 7.1 MB（文件数降到 1/100，字节不变） | **0.21 s**（快约 90 倍） |
+| 34,000 个文件 / 0.7 MB（字节降到 1/10，文件数不变） | **约 20 s**（基本不变） |
+
+独立复核的受控矩阵同样印证：文件数 ×10 → 耗时 **+6.3~6.5 s**；体积 ×10 → 仅 **+0.4~0.7 s**。
+真实解压 33.96 s 中，纯顺序字节写入只占约 0.55 s。
+
+即**每个文件都要一次 inode 创建 + 元数据写 + close，这个固定成本远大于字节写入**。
+所以"把包压小"几乎没有意义，**减少文件数**才有效。
+
+> 上表是本机（Windows/NTFS）实测，绝对秒数随磁盘与文件系统而变，方向与量级可复现。
+
+#### 为什么只能在构建期解决
+
+官方文档写明 `install_init` 在「安装文件应用**前**执行」、`install_callback` 在
+「安装文件应用**后**执行」，包文件写入发生在两者**之间**，由 fnOS 自己完成。
+因此任何"在 `cmd/` 脚本里挪动运行时"（解压后再删、延迟下载、事后搬移）的方案
+对装包耗时**完全无效** —— 字节和 inode 都已经写完了。只能减小包本身的文件数。
+
+#### 已实施的优化：保留符号链接
+
+`shutil.copytree` 默认 `symlinks=False`，会把运行时里的链接解引用成实体副本，导致包里
+出现 3 份完全相同的 32.2 MB python 解释器与 2 份 `libpython3.14.so`（sha256 一致），
+白占约 **93 MB**。这些在真实 CPython 安装里本来就是符号链接。
+
+改为 `copy_tree_preserving_links`（`symlinks=True`）后只存一份实体 + 若干链接条目，
+并附带**链接审计**：任何指向包外的绝对链接都会被拦下并终止构建（否则包能在构建机跑、
+搬到 NAS 就断链）。
+
+构建期还会打印"打包写入代价"（各目录的体积**与文件数**占比），并对
+"`python/` 下 0 个符号链接"给出回归告警。
+
+#### 未能实施：lark_oapi 未使用业务域的裁剪（已实测证明不可行）
+
+`lark_oapi` 是全包**文件数最多的单个包** —— 11,112 个文件，占全包 34,689 个文件的
+**32%**，却只占 18.6 MB / 2.6% 体积。按"文件数主导"的结论，它本来是收益最大的目标：
+它自带飞书 OpenAPI **全部 58 个业务域**的自动生成 SDK（招聘 hire、人事 corehr、邮件、
+考勤……），而 MoviePilot 实际只用到 `im.v1`（消息）与 `cardkit.v1`（卡片）—— 这有上游
+自带的架构依赖基线 `mp/tests/fixtures/architecture/dependency-baseline.json` 逐条佐证。
+
+**但"只删 api/&lt;域&gt;/ 目录"必然失败**，因为 `lark_oapi` 的顶层导入链主动引用了全部域：
+
+| 文件 | 内容 |
+|------|------|
+| `lark_oapi/__init__.py` | `from .api import *` |
+| `lark_oapi/api/__init__.py` | **57 行 `from . import <域>`**（eager import） |
+| `lark_oapi/client.py` | **57 条 `from .api.<域>.service import <X>Service`**，每个类另在 `Client` 里有 3 处使用点 |
+
+删掉任一未保留域，`import lark_oapi` 立即 `ImportError`（飞书渠道整体失效）。
+要让裁剪生效只有两条路，**两条都已被评估为不可接受**：
+
+- **改写 wheel 内第三方源码**：实测需改约 112 条导入 + 165 处类引用，等于 fork 掉
+  `lark-oapi`；上游每次 bump 都可能静默失配，而失配的后果是**运行期**飞书功能炸，
+  不是构建期报错。收益（约 10,360 个文件）与长期维护风险不成比例。
+- **把域打包成 zip 用 zipimport 加载**：被裁的 56 个域确实全是纯 Python（zip 内 0 个
+  `.so`），文件数收益真实（11,138 → 780）。但 `lark_oapi` 无法自我挂载 zip 到
+  `sys.path`（它得先被 import 才能执行代码），必须靠 `.pth` / `sitecustomize` 从外部注入，
+  而这条注入链依赖 CPython 的 site 机制，**未能在真机启动路径上验证**，因此不采用。
+
+结论：**在"不改第三方库、不依赖未验证的注入链"的前提下，这个文件数瓶颈无法安全消除**。
+如将来要重启这项工作，请先读完上面两条评估，并注意若沿用目录删除方案，
+`victims` 必须排除 `api/__pycache__` 这类非业务域目录。
+
+#### 已做的小项
 
 - **`upgrade_init` 的配置备份不再无条件全量拷贝**。config/ 含 SQLite 库、插件、缓存与
   图片，全量 `cp -a` 是实打实的 IO；故按代价从低到高降级：先用 `cp -al` 硬链接（秒级、
@@ -398,6 +467,18 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
   能白烧一两分钟。跳过不影响正确性：`repair_resources`（纯本地、不联网）仍会执行，而下次
   正常重启或手动 `cmd/main update` 仍照常联网检查。
 
+#### 验证方式
+
+回归断言见 `tools/pkgsize_smoke.py`（契约层 + 行为层），覆盖：符号链接是否被保留、
+链接审计能否拦住指向包外的链接、打包写入代价统计是否可用，以及"未重新引入 lark 目录裁剪"
+与"文件数主导"结论的登记。
+
+> **验收新包是否真的生效，不能只看测试通过** —— 那是源码文本断言，无法证明发出的包里
+> 真的保留了链接。要直接读 fpk：
+> ```bash
+> # 包内符号链接数应 > 0（修复前实测为 0）
+> python -c "import tarfile,io;t=tarfile.open('moviepilot-x.y.z-amd64.fpk','r:gz');print(sum(1 for m in tarfile.open(fileobj=io.BytesIO(t.extractfile('app.tgz').read()),mode='r:gz') if m.issym()))"
+> ```
 > 排查装包升级耗时，看 `TRIM_PKGVAR` 下的三份日志：`upgrade.log`（停服务 / 备份模式 /
 > 迁移 / 重启）、`install.log`（依赖安装）、`update.log`（联网检查与下载，每行带完整 URL）。
 
