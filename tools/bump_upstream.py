@@ -152,6 +152,175 @@ def upstream_tags(token=None):
 
 
 # ---------------------------------------------------------------------------
+# 上游 Release 说明的抓取与清洗
+# ---------------------------------------------------------------------------
+
+# 上游 Release body 的章节标题形态：`## 本次更新内容` / `## 完整变更记录` / `## 版本对比`。
+SECTION_RE = re.compile(r"(?m)^#{1,6}\s+(?P<title>.+?)\s*$")
+
+# 只取「本次更新内容」这段。**刻意不取「完整变更记录」**：那段是
+# `feat(update): prepare latest updates for a single restart by @jxxghp` 这种
+# 中英混杂的逐条 commit 列表，整体塞进应用中心的更新日志里既长又难读；
+# 而「本次更新内容」是上游写给终端用户看的自然语言摘要，正是我们要的口径。
+SUMMARY_SECTION_TITLES = ("本次更新内容",)
+
+# 「版本对比」之外还要裁掉 body 里裸放的 compare 链接与分隔线：上游把
+# `https://github.com/.../compare/...` 直接写在正文里（不带 markdown 链接语法），
+# GitHub 渲染时自动 linkify，但 API 返回的原文里就是一条光秃秃的长 URL。
+_URL_RE = re.compile(r"https?://\S+")
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\((?:[^)]*)\)")
+_HR_RE = re.compile(r"(?m)^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?P<body>.+)$")
+
+# 摘要总长上限（Unicode 字符数，不是字节 —— 中文按 1 个字符算）。
+# 200 字符约合 3~4 行中文：够说清上游这次改了什么，又不会让应用中心的
+# 更新日志长到没人看。
+SUMMARY_MAX_CHARS = 200
+
+# 单条 bullet 的字符上限：上游个别条目很长（一句话里塞三四个修复），
+# 不设上限会导致第 1 条就吃满总预算、后面所有条目全被截掉。
+SUMMARY_MAX_ITEM_CHARS = 90
+
+# 摘要里最多保留几条 bullet。
+SUMMARY_MAX_ITEMS = 3
+
+
+def fetch_upstream_notes(upstream_tag, token=None):
+    """取上游 Release 里「本次更新内容」段的原始文本；取不到返回 ""。
+
+    为什么用 releases/latest 而不是 releases/tags/<tag>
+    ------------------------------------------------
+    两个接口的返回是**不同的 schema**：`releases/tags/<tag>` 给的是轻量 schema，
+    body 往往是空的；只有 `releases/latest` 才带完整 body（实测 6000+ 字符）。
+    所以这里必须用 latest，**再校验 tag_name 与目标 tag 完全相等** —— 上游发新版
+    后 latest 会立刻指向新 tag，而我们要编的是 pin 住的那个版本，两者不一致时
+    宁可不写摘要，也不能把新版本的说明写到旧版本的 changelog 里。
+
+    本函数**不抛异常**：任何失败（网络、限流、404、tag 不匹配、body 为空）都返回
+    ""，由调用方回退到固定文案。摘要只是锦上添花，绝不能让它把每周的发布流程拖挂。
+    """
+    try:
+        rel = api_get(f"repos/{build.UPSTREAM_REPO}/releases/latest", token)
+    except Exception as e:
+        log(f"  [提示] 读取上游 Release 失败，changelog 用固定文案: {e}")
+        return ""
+
+    if not isinstance(rel, dict):
+        log("  [提示] 上游 Release 返回不是对象，changelog 用固定文案")
+        return ""
+
+    remote_tag = str(rel.get("tag_name") or "").strip()
+    if remote_tag != upstream_tag:
+        log(f"  [提示] 上游 latest 是 {remote_tag or '（空）'}，"
+            f"与目标 {upstream_tag} 不一致，changelog 用固定文案")
+        return ""
+
+    body = rel.get("body")
+    if not isinstance(body, str) or not body.strip():
+        log("  [提示] 上游 Release 没有说明正文，changelog 用固定文案")
+        return ""
+
+    return extract_summary_section(body)
+
+
+def extract_summary_section(body):
+    """从 Release body 里切出「本次更新内容」段，返回该段文本（找不到返回整个 body）。"""
+    matches = list(SECTION_RE.finditer(body))
+
+    # 优先按标题找目标段。
+    for i, m in enumerate(matches):
+        if m.group("title").strip() in SUMMARY_SECTION_TITLES:
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
+            return body[m.end():end]
+
+    # 没有标题的 body（上游偶尔直接写正文）：整体拿来用，让下面的清洗去兜底。
+    return body if not matches else ""
+
+
+def sanitize_notes(raw):
+    """把上游 Markdown 摘要洗成一行、可直接塞进 manifest changelog 的文本。
+
+    清洗链的每一步都对应一个**真实会咬人的坑**：
+
+      1. 去 markdown 链接语法，只留链接文字（应用中心不渲染 markdown，留着就是噪音）
+      2. 去裸 URL 与分隔线
+      3. `;` → `；`  —— 最关键的一步：fnpack 遇到半角分号会**截断整行取值**，
+         而 check_manifest_values() 是抛异常，会让整个 job 失败（不是回退！）。
+         上游说明里出现一句半角分号，下周二的自动发布就直接挂掉。
+         当前上游 body 实测 0 处半角分号（全角 5 处），但这是运气不是保证。
+      4. 压空白、去空行
+      5. bullet 剥掉上游自带编号、连成一句（`；` 连接），并逐条限长
+      6. 总长限 SUMMARY_MAX_CHARS，超出加省略号
+    """
+    text = raw
+
+    # 1. markdown 链接 → 只留文字
+    text = _MD_LINK_RE.sub(r"\1", text)
+    # 2. 裸 URL / 分隔线 / 标题残留（`#` 开头的行）
+    text = _URL_RE.sub("", text)
+    text = _HR_RE.sub("", text)
+    text = re.sub(r"(?m)^\s*#{1,6}\s*", "", text)
+
+    # 3. 半角分号归一（见 docstring）—— 必须在拼接 `<br>` 之前做，
+    #    否则模板里自己加的 `<br>` 结构不会被误伤（它本来也不含分号）。
+    text = text.replace(";", "；")
+    # 全角分号在 manifest 里是安全的（terminator 只拦半角），保留。
+    # 同理顺手把会干扰 <br> 结构的尖括号风险字符归一。
+    text = text.replace("<", "＜").replace(">", "＞")
+
+    # 4. 逐行处理：bullet 提正文、其余压空白
+    items = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = _LIST_ITEM_RE.match(line)
+        items.append(m.group("body").strip() if m else line)
+
+    if not items:
+        return ""
+
+    # 5. 逐条限长 + 条数上限，用全角分号连成一句连续文本。
+    #
+    # **刻意不再给上游条目编号**：上游自己写的就是 `1.…2.…3.…`，若原样保留，
+    # changelog 里就会出现两套互相打架的编号 —— 外层是「1.更新内容 / 2.源码零改动
+    # / 3.自带运行时 / 4.自动生成」，内层又冒出「1.优化在线升级…3.升级多渠道消息」，
+    # 读者看到「3.」无法判断指的是哪一层（实测确实如此）。改成用 `；` 连接的连续
+    # 文字后，全文只剩外层一套编号，语义唯一。
+    #
+    # 副作用：内层编号被吃掉后，段落开头会直接接内容，所以先把上游自带的
+    # 「1. / 2. / 3.」前缀剥掉，避免出现「；1.优化…」这种残留。
+    clipped = []
+    for it in items[:SUMMARY_MAX_ITEMS]:
+        it = re.sub(r"^\d+[.)]\s*", "", it).strip()
+        it = re.sub(r"[ \t]+", " ", it).strip()
+        # 上游条目自带句末标点（实测是 `。`），用 `；` 连接会连出「布局。；新增」
+        # 这种「句号紧跟分号」的畸形标点。连句前先把句末标点统一剥掉，只留连接符。
+        it = re.sub(r"[。.；;、,，]+$", "", it).strip()
+        if len(it) > SUMMARY_MAX_ITEM_CHARS:
+            it = it[:SUMMARY_MAX_ITEM_CHARS] + "…"
+        clipped.append(it)
+    text = "；".join(c for c in clipped if c)
+
+    # 6. 总长上限
+    if len(text) > SUMMARY_MAX_CHARS:
+        text = text[:SUMMARY_MAX_CHARS] + "…"
+    return text
+
+
+def upstream_summary(upstream_tag, token=None):
+    """取并清洗上游摘要，返回可直接写进 changelog 的文本；取不到返回 ""。"""
+    raw = fetch_upstream_notes(upstream_tag, token)
+    if not raw:
+        return ""
+    clean = sanitize_notes(raw)
+    if not clean:
+        log("  [提示] 上游说明清洗后为空，changelog 用固定文案")
+        return ""
+    return clean
+
+
+# ---------------------------------------------------------------------------
 # build.py 的 pin 改写
 # ---------------------------------------------------------------------------
 
@@ -249,23 +418,34 @@ def set_manifest_key(text, key, value):
     return "".join(lines)
 
 
-def changelog_entry(upstream_tag, app_version):
+def changelog_entry(upstream_tag, app_version, upstream_notes=""):
     """生成新版本的 changelog 条目（单条，不累积）。
 
-    上游没有机器可读的 changelog，所以这里写的是**本仓库视角**的说明：跟了哪个
-    上游 tag、这次产物是什么。逐条列上游 commit 不在本脚本职责内（也做不到可靠）。
+    第 1 条的文案分两种：
+      - 拿到上游 Release 摘要时，写「上游 <tag> 更新内容——<摘要>」；
+      - 拿不到（网络/限流/tag 不匹配/正文为空）时，回退成本仓库视角的固定文案。
+
+    第 2~4 条固定描述本仓库的打包口径，与上游说明无关，两种情况都一样。
+
+    `upstream_notes` 必须是已经过 sanitize_notes 的文本 —— 直接拼原始 body 会把
+    半角分号带进 manifest，进而让 fnpack 截断取值、job 失败。
     """
+    if upstream_notes:
+        first = f"1.上游 MoviePilot {upstream_tag} 更新内容——{upstream_notes}"
+    else:
+        first = (f"1.跟进上游 MoviePilot {upstream_tag}：构建 pin 与 manifest 版本同步更新，"
+                 f"包名版本与上游 tag 一一对应")
+
     return (
         f"v{app_version}<br>"
-        f"1.跟进上游 MoviePilot {upstream_tag}：构建 pin 与 manifest 版本同步更新，"
-        f"包名版本与上游 tag 一一对应<br>"
+        f"{first}<br>"
         f"2.上游源码零改动原样集成，仅做 fnOS 打包适配（生命周期脚本、统一网关、桌面入口）<br>"
         f"3.自带 CPython {build.PYTHON_FULL_VERSION} 运行时与全部依赖，安装时无需联网<br>"
         f"4.本条目由 GitHub Actions 定时检查上游后自动生成"
     )
 
 
-def bump_manifest(upstream_tag, app_version):
+def bump_manifest(upstream_tag, app_version, upstream_notes=""):
     """把 manifest 的 version / changelog 改到位，返回 (新文本, 是否有改动)。
 
     版本号已经是目标值时**不动 changelog** —— 这样 `--force` 就是纯粹的
@@ -277,7 +457,7 @@ def bump_manifest(upstream_tag, app_version):
         log(f"  manifest: version 已是 {app_version}，changelog 保持不变（重打包）")
         return text, False
 
-    new_entry = changelog_entry(upstream_tag, app_version)
+    new_entry = changelog_entry(upstream_tag, app_version, upstream_notes)
     m = re.search(r"(?m)^changelog\s*=\s*(.*)$", text)
     if not m:
         raise RuntimeError("manifest 里读不到 changelog")
@@ -393,7 +573,15 @@ def main():
         log("  （--force：上游无新版本，pin 不变）")
 
     log("[2/3] 改 manifest（version + changelog）...")
-    text, changed = bump_manifest(target_tag, app_version)
+    # 只有真要改 changelog 时才去抓上游说明：版本未变（--force 重打包）时
+    # bump_manifest 会原样返回，这里多抓一次纯属浪费一次 API 配额。
+    notes = ""
+    if manifest_version(read_manifest()) != app_version:
+        log("  抓取上游 Release 说明 ...")
+        notes = upstream_summary(target_tag, token)
+        if notes:
+            log(f"  已取到上游摘要（{len(notes)} 字符）")
+    text, changed = bump_manifest(target_tag, app_version, notes)
     write_manifest(text)
     load_build()
 

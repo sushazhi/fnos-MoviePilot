@@ -111,7 +111,7 @@ MoviePilot V3 的 `pyproject.toml` 声明 `requires-python >= 3.14`，而 fnOS �
 ├── build.py                    # 跨平台构建脚本（推荐）
 ├── tools/
 │   ├── bump_upstream.py        # 上游版本检查/升级：改 build.py 的 pin + 同步 manifest（CI 每周跑，本地也可跑）
-│   ├── bump_upstream_smoke.py  # 上游版本检查/升级的离线冒烟测试（沙箱，不联网；钉住「changelog 只保留最新版本」）
+│   ├── bump_upstream_smoke.py  # 上游版本检查/升级的离线冒烟测试（沙箱，不联网；钉住「changelog 只保留最新版本」与上游摘要清洗/回退）
 │   ├── updater_smoke.py        # 自更新器离线冒烟测试（主程序 + 站点资源同步，沙箱，Windows 亦可跑）
 │   ├── resources_smoke.py      # 站点资源修复/回填的离线冒烟测试
 │   ├── supervisor_smoke.py     # 进程托管（失败计数/退避/重启）的离线冒烟测试
@@ -203,8 +203,23 @@ pin 与 `manifest`（`version` + `changelog`）→ 提交 master → 打同名 t
   **当前版本这一条**条目（`tools/bump_upstream.py` 的 `MAX_CHANGELOG_ENTRIES = 1`）。
   changelog 会进包内 manifest 并显示在应用中心，同时又是 Release notes 的来源，越滚越长没有意义；
   所以每次跟进上游都是**整条替换**，而不是把新条目追加到历史条目后面。
+- **更新日志第 1 条会带上上游这次的说明**：脚本会取上游 Release 的「本次更新内容」段，
+  清洗成一行塞进第 1 条（如 `1.上游 MoviePilot v3.1.6 更新内容——优化在线升级流程…`）。
+  设计要点：
+  - 用 `releases/latest` 而**不是** `releases/tags/<tag>` —— 后者返回的是轻量 schema，
+    `body` 往往是空的；用 latest 则必须校验 `tag_name` 与目标 tag 完全相等，否则不写摘要
+    （避免把新版本的说明写进旧版本的日志）。
+  - 只取「本次更新内容」段，**刻意不取「完整变更记录」** —— 那段是 `feat(update): …` 的
+    逐条 commit 列表，中英混杂，不适合放进应用中心。
+  - 半角 `;` 会被归一为全角 `；`。这是**硬约束**：fnpack 遇到半角分号会截断整行取值，
+    而 `check_manifest_values()` 是抛异常（不是回退），一个分号就能让整条发布流程失败。
+  - 上游条目自带的 `1. 2. 3.` 编号会被剥掉、改用 `；` 连接，避免与外层的 4 条编号打架。
+  - **任何失败都回退到固定文案**（网络/限流/tag 不匹配/正文为空/清洗后为空），
+    摘要只是锦上添花，绝不能让每周的发布流程中断。
+  - 摘要上限 200 字符（Unicode 字符数），单条 90 字符，最多 3 条。
 - **强制重打当前版本**：手动跑本 workflow 并勾上 `force`（用于验证流水线）。此时 `version`
   已经是目标值，脚本**不会**再动 `changelog`，因此反复重跑也不会往里面塞重复条目。
+  （顺带：版本未变时也**不会**去抓上游说明，省一次 API 配额。）
 - **手动补发某个版本**：跑 `build-and-release.yml`，ref 填对应 tag。
 
 > 本地也可以跑同一套逻辑（不需要 CI）：`python tools/bump_upstream.py --detect` 只看有没有更新，
@@ -213,6 +228,7 @@ pin 与 `manifest`（`version` + `changelog`）→ 提交 master → 打同名 t
 > 「只保留最新一条」这条口径由 `tools/bump_upstream_smoke.py` 离线冒烟测试钉住（不联网，
 > 沙箱内造一份含三条历史条目的 manifest，断言改完只剩一条）。改 `MAX_CHANGELOG_ENTRIES`
 > 或去掉「版本未变就不动 changelog」的守卫都会让它失败 —— 这两处一旦被改，累积就会悄悄回来。
+> 上游摘要的清洗/截断/分号归一/回退矩阵同样由该文件覆盖（H/I/J/K 四组，共 30 余项断言）。
 
 ## 安装
 
