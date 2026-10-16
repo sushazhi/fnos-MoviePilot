@@ -39,7 +39,7 @@ jobs:
 
       - name: Set up Python
         # 仅用于驱动 build.py / uv。uv 需能解析 MoviePilot 的 requires-python >= 3.14，
-        # 故 runner 上的解释器不能低于 3.14（真正打进包的是下面下载的 PBS 3.14.7）。
+        # 故 runner 上的解释器不能低于 3.14（真正打进包的是下面下载的 PBS 3.14.8）。
         uses: actions/setup-python@v7
         with:
           python-version: '3.14'
@@ -84,8 +84,8 @@ jobs:
 
       - name: Build .fpk (with bundled Python 3.14 runtime)
         # --with-runtime 会：
-        #   1. 下载 astral-sh/python-build-standalone 的可重定位 CPython 3.14.7
-        #      （*install_only_stripped*，arm64 约 29 MB / amd64 约 34 MB）
+        #   1. 下载 astral-sh/python-build-standalone 的可重定位 CPython 3.14.8
+        #      （*install_only_stripped*，arm64 约 30 MB / amd64 约 35 MB）
         #   2. 用 uv 从 MoviePilot 的 uv.lock 导出 runtime-standard 组需求，
         #      再装进该解释器的 site-packages（优先预编译 wheel，缺失才源码构建；
         #      anitopy / pinyin2hanzi 等纯 Python 包只有 sdist，不能 --no-build 一刀切）
@@ -188,7 +188,7 @@ jobs:
 
           **Version:** ${{ env.APP_VERSION }}
           **Architecture:** ${{ matrix.arch }}
-          **Bundled runtime:** CPython 3.14.7 (python-build-standalone, 安装时无需联网)
+          **Bundled runtime:** CPython 3.14.8 (python-build-standalone, 安装时无需联网)
           **Package size:** $(du -h "${PACKAGE_NAME}" | cut -f1)
 
           **Git Info:**

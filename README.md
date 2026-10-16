@@ -17,7 +17,7 @@
 | 后端 | MoviePilot V3（FastAPI + Python 3.14），监听 `127.0.0.1:3002` |
 | 前端 | MoviePilot-Frontend（Vue3 预编译 `dist.zip`），Express 静态服务监听 `127.0.0.1:3005`，并代理 `/api`、`/cookiecloud` 到后端 |
 | 网关代理 | `app/bin/gateway-proxy.py`，Unix Socket → 前端端口，完成前缀剥离、JS polyfill、WebSocket 隧道 |
-| Python 运行时 | **自带 CPython 3.14.7**（python-build-standalone，随包分发，安装时不联网）。`manifest` 已不再声明 fnOS 的 `python312` —— 版本不够且用不上，无需安装 |
+| Python 运行时 | **自带 CPython 3.14.8**（python-build-standalone，随包分发，安装时不联网）。`manifest` 已不再声明 fnOS 的 `python312` —— 版本不够且用不上，无需安装 |
 | Node 运行时 | fnOS `nodejs_v24`（`manifest` 的 `install_dep_apps` 声明依赖，前端静态服务需要） |
 | 数据库 | SQLite（默认），配置存于 `TRIM_PKGVAR/config` |
 
@@ -74,7 +74,7 @@ curl -i -H "X-MP-Auth: Bearer $TOKEN"      'http://<NAS>/app/moviepilot/api/v1/d
 
 MoviePilot V3 的 `pyproject.toml` 声明 `requires-python >= 3.14`，而 fnOS 应用中心提供的运行时是 `python312` —— 版本不够。官方 Docker 镜像的处理方式同样是自带解释器（`/opt/python`）。本应用沿用同一思路：
 
-- 构建时下载 [python-build-standalone](https://github.com/astral-sh/python-build-standalone) 的 `cpython-3.14.7`（`install_only_stripped`，arm64 约 29 MB / amd64 约 34 MB）
+- 构建时下载 [python-build-standalone](https://github.com/astral-sh/python-build-standalone) 的 `cpython-3.14.8`（`install_only_stripped`，arm64 约 30 MB / amd64 约 35 MB）
 - 用 `uv` 按 MoviePilot 的 `uv.lock` 把依赖直接装进该解释器的 `site-packages`
 - 整个 `app/python/` 随包分发，**安装时零联网、零编译**
 
@@ -150,7 +150,7 @@ python build.py --with-runtime --no-build
 1. 从 GitHub 下载 MoviePilot V3 源码到 `.local-build/mp`（打包内置）。**下载的是 `build.py` 里 `UPSTREAM_TAG` 钉住的那个上游 tag**（当前 `v3.0.10-1`），而不是每次去查 `releases/latest` —— 同一个 tag 的包必须可复现，否则上游一发新版，重跑同一次构建就会悄悄换成新代码，而包名还写着旧版本。升级上游就是改这一个常量（`tools/bump_upstream.py` 自动改，并同步 `manifest`）；只有该 tag 在上游被**确定性删除**（API 404）时才回退到 `releases/latest`
 2. 从 GitHub Releases 下载前端 `dist.zip` 到 `.local-build/frontend`（打包内置）
 3. 同步 MoviePilot-Resources 资源包到后端源码的站点资源目录（V3 必需；目录名随上游重构变过，`app/helper` → `app/application/site`，构建时按源码结构自动定位，缺失会报 `No module named 'app.application.site.sites'`）
-4. （可选 `--with-runtime`）下载 CPython 3.14.7 到 `.local-build/python`，用 `uv` 按 `uv.lock` 装依赖，并做三道自检（依赖自检 / wheel glibc 审计 / 关键路径断言）
+4. （可选 `--with-runtime`）下载 CPython 3.14.8 到 `.local-build/python`，用 `uv` 按 `uv.lock` 装依赖，并做三道自检（依赖自检 / wheel glibc 审计 / 关键路径断言）
 5. 在 `.local-build/pkg/` 组装干净的应用目录树（仓库源码 + 构建产物），下载 fnpack 到 `.local-build/tools` 并打包生成 `moviepilot-<version>.fpk`
 
 **所有下载/解压/构建产物统一收敛到 `.local-build/`（已 gitignore，不入库）**，项目根目录不残留任何构建产物。

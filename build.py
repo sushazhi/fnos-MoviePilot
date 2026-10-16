@@ -100,10 +100,16 @@ PROXIES = ("https://gh.dpik.top/", "https://v4.gh-proxy.org/")
 # 而 fnOS 应用中心只提供 python312，所以必须自带解释器（官方 Docker 镜像同样自带
 # /opt/python）。运行时版本与打包产物必须一致，sites 原生变体也按它来挑。
 PYTHON_VERSION = "3.14"
-PYTHON_FULL_VERSION = "3.14.7"
+PYTHON_FULL_VERSION = "3.14.8"
 # python-build-standalone 的发行版 tag 与资产命名（固定以保证构建可复现；
 # 资源下架时改这两个常量即可，报错信息里会提示）
-PBS_TAG = "20260901"
+#
+# PYTHON_VERSION（小版本，决定 sites 原生资源的 ABI 标签）与 PYTHON_FULL_VERSION
+# （补丁号，决定实际下载的解释器）必须分开看：只有打补丁号才只动后者。
+# 跨小版本（如 3.14 → 3.15）会改变 ABI 标签，上游 MoviePilot-Resources 必须已发布
+# 对应的 sites.cpython-<小版本>-*.so，否则站点认证扩展下载不到、功能整体失效。
+# 当前上游只有 cp311/cp312/cp313/cp314(/314t)，因此本包停在 3.14 系列。
+PBS_TAG = "20261013"
 PBS_REPO = "astral-sh/python-build-standalone"
 PBS_ASSET = "cpython-" + PYTHON_FULL_VERSION + "+" + PBS_TAG + "-{abi}-unknown-linux-gnu-install_only_stripped.tar.gz"
 PBS_ASSET_ARCH = {"amd64": "x86_64", "arm64": "aarch64"}
@@ -906,9 +912,11 @@ def _trim_runtime(python_dir):
     只删 CPython 自带的测试套件（lib/pythonX.Y/test，几十 MB），无功能影响。
 
     刻意**保留**两样东西：
-      - site-packages 与标准库的 __pycache__/*.pyc：它们由同一个 3.14.7 解释器
-        生成，magic 号必然匹配，留着能让应用首次启动免去重编译（langchain 之类
-        动辄上千个模块，现场编译会让首次启动慢很多）。
+      - site-packages 与标准库的 __pycache__/*.pyc：它们由同一个自带解释器
+        （PYTHON_FULL_VERSION）生成，magic 号必然匹配，留着能让应用首次启动免去重编译
+        （langchain 之类动辄上千个模块，现场编译会让首次启动慢很多）。
+        注意：一旦改动 PYTHON_FULL_VERSION，这里保留的 .pyc 就会与新解释器的 magic 号
+        不匹配而全部失效，首次启动需重新编译；要保住这项优化必须在同一版本下重新构建。
       - .dist-info / .egg-info：importlib.metadata 靠它读包版本，删掉会让依赖
         自检与版本展示出错（旧版 _trim_venv 删过，是个坑）。
     """
@@ -1124,8 +1132,8 @@ def prepare_pkg(include_runtime, target_arch=None):
     _filter_sites_binaries(pkg_app / "mp", target_arch)
 
     # 3. 自带 Python 运行时 + 依赖。cmd/* 以 ${TRIM_APPDEST}/python 作为解释器根，
-    #    所以这里**不能**套 ignore_junk —— 标准库与 site-packages 的 .pyc 由同一个
-    #    3.14.7 解释器生成，留着能让首次启动免去重编译。
+    #    所以这里**不能**套 ignore_junk —— 标准库与 site-packages 的 .pyc 由同一个自带
+    #    解释器（PYTHON_FULL_VERSION）生成，留着能让首次启动免去重编译。
     #
     #    必须 symlinks=True（见 copy_tree_preserving_links 的说明）：运行时里
     #    bin/python、bin/python3、lib/libpython3.14.so.1.0 等原本都是**符号链接**，
