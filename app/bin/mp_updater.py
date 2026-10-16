@@ -48,7 +48,7 @@ MoviePilot fnOS 应用自更新器（重启即升级）
   FRONTEND_DIR    前端 dist 目录
   CONFIG_DIR      配置目录（状态文件放这里）
   APP_PYTHON      应用主解释器（自带运行时）
-  TRIM_PKGTMP     暂存目录
+  TRIM_PKGTMP     暂存目录（不存在/不可写时自动退到 CONFIG_DIR/tmp）
   MP_UPDATE_LOG / SHARE_LOG   日志
   MP_AUTO_UPDATE      1/0      是否开启（默认 1）
   MP_UPDATE_CHANNEL   release|prerelease|off（默认 release）
@@ -261,13 +261,40 @@ def _load_env_file(path: Path) -> dict:
     return data
 
 
+def _resolve_tmp_dir(preferred: str, config_dir: Path) -> Path:
+    """选一个确实可写的暂存目录。
+
+    TRIM_PKGTMP（fnOS 的 /vol{n}/@apptemp/{appname}）不保证存在，且 /vol{n}/@apptemp
+    本身是 root:755，应用运行用户无权在其中补建子目录。此前直接采用它，会让下载、
+    解压与备份全崩在"目录不可写"上——cmd/main 的启动路径看不到区分，只表现为
+    更新检查常年 rc=1。这里逐个探测，退到应用数据目录（一定归运行用户所有）。
+    """
+    candidates = [preferred, os.environ.get("TMPDIR", "")]
+    if config_dir:
+        candidates.append(str(config_dir / "tmp"))
+    for raw in candidates:
+        if not raw:
+            continue
+        path = Path(raw)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".mp_update_probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return path
+        except OSError:
+            continue
+    # 全都不行时保持原值，让调用方的 ensure_writable() 报出确切路径与原因
+    return Path(preferred or "/tmp")
+
+
 class Config:
     def __init__(self) -> None:
         self.mp_src = Path(os.environ.get("MP_SRC", "")).resolve()
         self.frontend_dir = Path(os.environ.get("FRONTEND_DIR", "")).resolve()
         self.config_dir = Path(os.environ.get("CONFIG_DIR", "")).resolve()
         tmp = os.environ.get("TRIM_PKGTMP") or os.environ.get("TMPDIR") or "/tmp"
-        self.tmp_dir = Path(tmp)
+        self.tmp_dir = _resolve_tmp_dir(tmp, self.config_dir)
         self.python = os.environ.get("APP_PYTHON") or sys.executable
         self._file_env = _load_env_file(self.config_dir / "app.env") if self.config_dir else {}
         self.state_file = self.config_dir / "mp_update.json" if self.config_dir else None

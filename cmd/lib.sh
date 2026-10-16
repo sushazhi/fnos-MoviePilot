@@ -376,3 +376,33 @@ mp_any_python() {
     fi
     command -v python3 2>/dev/null
 }
+
+# 确保包的临时目录可用，并把它交给应用运行用户。
+#
+# 背景（线上事故）：fnOS 的 TRIM_PKGTMP 指向 /vol{n}/@apptemp/{appname}，这个目录
+# **不保证存在**；而它的父目录 /vol{n}/@apptemp 是 root:755，应用以专用用户运行
+# （见 config/privilege 的 run-as: package），根本无权在其中补建子目录。于是
+# cmd/main 里 `mkdir -p "$TRIM_PKGTMP"` 静默失败，后续把该目录当作重定向落点：
+#   * `nohup supervisor.py >> "$SUPER_STDIO_LOG"` —— 重定向失败，bash 直接放弃执行
+#     整条命令，主管进程从未启动，界面只显示"主管进程启动失败"且日志无任何线索；
+#   * 更新器 stdio 落点同样失败，启动前的 `mp_updater --auto` 因此常年 rc=1。
+#
+# install / upgrade 阶段以 root 运行，是唯一能正确建出这个目录并把属主交给运行
+# 用户的时机；先建好，运行期就不会再落到那条失败路径上。
+# 返回：0 = 目录就绪（回显路径）；1 = 无法创建（调用方自行兜底）
+mp_ensure_pkgtmp() {
+    local dir="${TRIM_PKGTMP:-}" user
+    [ -n "$dir" ] || return 1
+    mkdir -p "$dir" 2>/dev/null || return 1
+    if user="$(mp_app_user)" && chown -R "${user}:${user}" "$dir" 2>/dev/null; then
+        # 属主已交给运行用户，可以收紧到 700
+        chmod 700 "$dir" 2>/dev/null || true
+    else
+        # 认不出运行用户时**不能**chmod 700：那会让 root 独占目录，反而重现
+        # "应用无法写入临时目录"这个故障。与 mp_secure_config 同一原则：
+        # 宁可靠宽松权限保证可用，也不能让应用写不进去。
+        chmod 777 "$dir" 2>/dev/null || true
+    fi
+    echo "$dir"
+    return 0
+}

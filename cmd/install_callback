@@ -51,6 +51,17 @@ mkdir -p "${CONFIG_DIR}" "${FRONTEND_DIR}"
 
 log "=== MoviePilot 安装初始化开始 ==="
 
+# 临时目录 TRIM_PKGTMP 不保证存在，而其父目录 /vol{n}/@apptemp 是 root:755，应用以
+# 专用用户运行时无权补建。安装阶段是 root，趁此时建好并交给运行用户，否则启动时
+# 主管进程的 stdout 重定向会失败，表现为"主管进程启动失败"且日志没有线索。
+if command -v mp_ensure_pkgtmp >/dev/null 2>&1; then
+    if mp_ensure_pkgtmp >/dev/null; then
+        log "临时目录就绪：${TRIM_PKGTMP}"
+    else
+        log "警告：无法创建临时目录 ${TRIM_PKGTMP}，启动时将退回应用数据目录"
+    fi
+fi
+
 # 1. 生成 / 更新 app.env（环境变量文件，供后端读取）
 #
 # 语义（含"覆盖安装绝不重建"的完整原因）见 lib.sh 的 mp_env_bootstrap：

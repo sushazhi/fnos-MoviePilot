@@ -56,6 +56,19 @@ mp_secure_config "${CONFIG_DIR}" "${CONFIG_DIR}/app.env" 1 || {
     fi
 }
 
+# 补齐临时目录：TRIM_PKGTMP（/vol{n}/@apptemp/{appname}）不保证存在，其父目录是
+# root:755，应用以专用用户运行时无权补建。升级阶段是 root，趁此时建好并交给运行
+# 用户——老版本装的应用升级上来时就靠这一步自愈，否则主管进程的 stdout 重定向会
+# 失败，表现仍是"主管进程启动失败"。旧版本可能已在别处留下 pid 文件，一并清理。
+if command -v mp_ensure_pkgtmp >/dev/null 2>&1; then
+    if mp_ensure_pkgtmp >/dev/null; then
+        log "临时目录就绪：${TRIM_PKGTMP}"
+        rm -f "${TRIM_PKGTMP}/${APP_NAME}-super.pid" 2>/dev/null || true
+    else
+        log "警告：无法创建临时目录 ${TRIM_PKGTMP}，启动时将退回应用数据目录"
+    fi
+fi
+
 # 补齐新增功能的默认值：app.env 只在安装时生成一次，旧版本装的应用升级上来后
 # 不会自动带上这些键。mp_env_ensure 只补缺失项，用户改过的配置不受影响。
 mp_env_ensure "${CONFIG_DIR}/app.env" "MP_AUTO_UPDATE" "1"

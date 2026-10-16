@@ -41,14 +41,37 @@ else
     fi
 fi
 
+# 临时目录解析：TRIM_PKGTMP 是 fnOS 约定的临时目录（/vol{n}/@apptemp/{appname}），
+# 但它**不保证存在**——实测主题数据卷上该目录可能缺失，而 /vol{n}/@apptemp 本身是
+# root:755，应用运行用户无权在其中补建子目录。此前直接拿它当重定向目标，导致
+#   nohup ... >> "$SUPER_STDIO_LOG" 2>&1 &
+# 这句重定向失败、命令根本没被执行，supervisor 从未启动，脚本却只报"主管进程启动
+# 失败"（真正的 bash 报错在那一行的 stderr 上被丢掉了）。启动前更新器的 stdio 落点
+# 同理，于是 "--auto" 也常年 rc=1。
+# 这里改为按"可创建且可写"逐个探测，永远退到一个本应用一定能写的目录；
+# 应用数据目录（TRIM_PKGVAR）归运行用户所有，兜底最可靠。
+mp_tmp_dir() {
+    local d
+    for d in "${TRIM_PKGTMP:-}" "${TRIM_PKGVAR:-}/tmp" "/tmp/${APP_NAME}"; do
+        [ -n "$d" ] || continue
+        if mkdir -p "$d" 2>/dev/null && [ -w "$d" ]; then
+            echo "$d"
+            return 0
+        fi
+    done
+    echo "${TRIM_PKGVAR:-/tmp}/${APP_NAME}"
+    return 1
+}
+MP_TMP="$(mp_tmp_dir)"
+
 SUPERVISOR="${BIN_DIR}/supervisor.py"
-SUPER_PID_FILE="${TRIM_PKGTMP}/${APP_NAME}-super.pid"
+SUPER_PID_FILE="${MP_TMP}/${APP_NAME}-super.pid"
 LOG_FILE="${TRIM_PKGVAR}/${APP_NAME}.log"
 # 主管进程（supervisor.py）的 stdout/stderr 落点。同 UPDATE_STDIO_LOG 的道理：
 # supervisor 的 log() 自己会写 LOG_FILE，再把它整个进程的 stdout 追加到同一个
 # 文件，就会让 moviepilot.log 每行重复两遍（实测）。这里只兜未捕获异常的
 # traceback，启动失败时再补进用户可见的错误日志。
-SUPER_STDIO_LOG="${TRIM_PKGTMP}/${APP_NAME}-supervisor-stdio.log"
+SUPER_STDIO_LOG="${MP_TMP}/${APP_NAME}-supervisor-stdio.log"
 GATEWAY_SOCK="${TRIM_APPDEST}/${APP_NAME}.sock"
 MP_UPDATER="${BIN_DIR}/mp_updater.py"
 MP_RESOURCES="${BIN_DIR}/mp_resources.py"
@@ -57,7 +80,7 @@ UPDATE_LOG="${TRIM_PKGVAR}/update.log"
 # 那个文件（MP_UPDATE_LOG），两边都写会让每一行重复两遍（实测）。这里改写到临时
 # 目录，只兜住"更新器没来得及 log 出去"的内容（未捕获异常的 traceback、timeout
 # 提示），失败时再把尾巴补进 UPDATE_LOG。
-UPDATE_STDIO_LOG="${TRIM_PKGTMP}/${APP_NAME}-updater-stdio.log"
+UPDATE_STDIO_LOG="${MP_TMP}/${APP_NAME}-updater-stdio.log"
 
 # 共享目录（用于写诊断日志，trim-cli 可读取）；未导出时跳过共享日志
 SHARE_PATHS="${TRIM_DATA_SHARE_PATHS:-}"
@@ -135,8 +158,11 @@ is_running() {
 run_updater() {
     [ -f "$MP_UPDATER" ] || { log "跳过更新检查：缺少 ${MP_UPDATER}"; return 0; }
     [ -x "$APP_PYTHON" ] || { log "跳过更新检查：Python 运行时不存在（${APP_PYTHON}）"; return 0; }
-    mkdir -p "${TRIM_PKGTMP}"
-    export MP_SRC FRONTEND_DIR CONFIG_DIR APP_PYTHON TRIM_PKGTMP SHARE_LOG
+    mkdir -p "${MP_TMP}" 2>/dev/null || true
+    # 传 MP_TMP 而不是 TRIM_PKGTMP：更新器内部按 TRIM_PKGTMP 建暂存目录，
+    # 而该目录可能不存在/不可写，会让更新器自身崩在下载阶段（表现为常年 rc=1）。
+    export MP_SRC FRONTEND_DIR CONFIG_DIR APP_PYTHON MP_TMP SHARE_LOG
+    export TRIM_PKGTMP="$MP_TMP"
     export MP_UPDATE_LOG="$UPDATE_LOG"
     local rc=0
     log "==> 检查上游更新（$*）"
@@ -206,6 +232,15 @@ start_app() {
         return 1
     fi
     rm -f "$GATEWAY_SOCK"
+    # 先把 stdio 落点建出来再重定向。若目标目录不存在/不可写，`>> "$SUPER_STDIO_LOG"`
+    # 会让 bash 直接放弃执行整条命令（子进程从未创建），而错误只印在 stderr 上——
+    # 现象就是"主管进程启动失败"但日志里毫无线索。这里显式失败并给出原因。
+    mkdir -p "$(dirname "$SUPER_STDIO_LOG")" 2>/dev/null || true
+    if ! : >> "$SUPER_STDIO_LOG" 2>/dev/null; then
+        echo "错误：无法写入主管进程日志（${SUPER_STDIO_LOG}），临时目录不可用" > "$TRIM_TEMP_LOGFILE"
+        log "错误：无法写入主管进程日志（${SUPER_STDIO_LOG}）"
+        return 1
+    fi
     log "启动主管进程 ..."
     nohup env \
         MP_SRC="$MP_SRC" VENV_DIR="$VENV_DIR" BIN_DIR="$BIN_DIR" \
@@ -214,26 +249,30 @@ start_app() {
         GATEWAY_SOCK="$GATEWAY_SOCK" LOG_FILE="$LOG_FILE" \
         SHARE_LOG="$SHARE_LOG" PYTHON_BIN="$PYTHON_BIN" \
         "$APP_PYTHON" "$SUPERVISOR" >> "$SUPER_STDIO_LOG" 2>&1 &
-    echo $! > "$SUPER_PID_FILE"
+    local super_pid=$!
+    echo "$super_pid" > "$SUPER_PID_FILE"
     disown 2>/dev/null || true
     # 确认主管进程存活
     local i=0
     while [ $i -lt 20 ]; do   # 最长 10 秒
-        if is_pid_alive "$(cat "$SUPER_PID_FILE")"; then
+        if is_pid_alive "$(cat "$SUPER_PID_FILE" 2>/dev/null)"; then
             return 0
         fi
         sleep 0.5
         i=$((i + 1))
     done
+    # 排障信息优先级：主管进程自己的 stdio（含 bash/python 的真实报错）> 存活状态。
     echo "错误：主管进程启动失败" > "$TRIM_TEMP_LOGFILE"
-    tail -20 "$LOG_FILE" >> "$TRIM_TEMP_LOGFILE"
-    # supervisor 自己也写 LOG_FILE，所以它的未捕获异常只会落在 stdio 文件里
-    if [ -s "$SUPER_STDIO_LOG" ]; then
-        {
-            echo "---- 主管进程 stdio 末尾 ----"
+    tail -20 "$LOG_FILE" >> "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+    # 注意：子进程已 disown，wait 取不到退出码（会立即返回 127），只能报存活状态。
+    {
+        echo "---- 主管进程 stdio 末尾 ----"
+        if [ -s "$SUPER_STDIO_LOG" ]; then
             tail -20 "$SUPER_STDIO_LOG"
-        } >> "$TRIM_TEMP_LOGFILE"
-    fi
+        else
+            echo "(无输出：主管进程未能执行或瞬间退出 pid=${super_pid}，请检查 ${SUPER_STDIO_LOG} 是否可写)"
+        fi
+    } >> "$TRIM_TEMP_LOGFILE"
     rm -f "$SUPER_PID_FILE"
     return 1
 }
@@ -259,7 +298,7 @@ stop_app() {
     rm -f "$SUPER_PID_FILE" "$GATEWAY_SOCK"
 }
 
-mkdir -p "$TRIM_PKGTMP"
+mkdir -p "$MP_TMP" 2>/dev/null || true
 rotate_logs
 
 case "${1:-}" in
