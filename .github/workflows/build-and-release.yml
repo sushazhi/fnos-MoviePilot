@@ -220,7 +220,34 @@ jobs:
 
       - name: Publish Release with Changelog
         run: |
-          CHANGELOG=$(grep "^changelog" manifest | sed 's/changelog\s*=\s*//' | sed 's/<br>/\n/g')
+          set -euo pipefail
+          # Release 正文只保留**第一条版本条目**的「版本号 + 第 1 条（本次更新内容）」。
+          # 第 2、3 条（上游零改动 / 自带运行时离线安装）与第 4 条（自动生成说明）都是
+          # 本仓库恒定的打包口径，不是「这个版本变了什么」，放在 Release notes 里是噪音。
+          # 它们只从**发布正文**里过滤掉，应用中心显示的 changelog（manifest）原样保留。
+          #
+          # 切分与 tools/bump_upstream.py 的 ENTRY_SPLIT_RE 同口径：
+          #   r"<br><br>(?=v?\d+\.\d+\.\d+)" —— 两个 `<br>` 且后面紧跟版本号才算条目边界，
+          # 免得把条目内部的段落分隔误当成边界。
+          #
+          # 取「前两段」（按 `<br>` 切成段）：段 1 = 版本号，段 2 = 第 1 条
+          # （第 1 条本身是单行拼接，内部不含 `<br>`）；段 3 起即第 2、3、4 条，丢弃。
+          # 本仓库口径 MAX_CHANGELOG_ENTRIES = 1，历史条目不会出现在 manifest 里；
+          # 万一出现，也已在第一步按同一正则截到第一条版本条目为止。
+          RAW=$(grep "^changelog" manifest | sed 's/changelog\s*=\s*//')
+          ENTRY=$(printf '%s\n' "$RAW" \
+            | sed 's/<br><br>\(v\?[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)/\n&/g' \
+            | head -n1 \
+            | sed 's/^<br><br>//')
+          CHANGELOG=$(printf '%s\n' "$ENTRY" | sed 's/<br>/\n/g' | head -n2)
+          if [ "$(printf '%s\n' "$CHANGELOG" | wc -l)" -lt 2 ]; then
+            echo "::error::manifest changelog 结构异常，取不到「版本号 + 第 1 条」两行"
+            printf '%s\n' "$ENTRY"
+            exit 1
+          fi
+          echo "----- Release notes -----"
+          printf '%s\n' "$CHANGELOG"
+          echo "-------------------------"
           TAG="${{ github.ref_name }}"
 
           echo "Publishing release..."

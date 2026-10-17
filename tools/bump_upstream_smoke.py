@@ -285,6 +285,44 @@ def main():
           f"entries={len(entries_of(vals2['changelog']))}")
 
     print()
+    print("== L. 打包口径（第 2、3 条）在日志里也要能看到 ==")
+    # 需求原话：Actions 检查更新的日志要显示
+    #   2.上游源码零改动原样集成…
+    #   3.自带 CPython x.y.z 运行时与全部依赖，安装时无需联网
+    pkg = bu.packaging_lines("3.1.6")
+    check("L1 打包口径共 3 条（第 2~4 条）", len(pkg) == 3, f"len={len(pkg)}")
+    check("L2 第 2 条为上游零改动",
+          pkg[0] == "2.上游源码零改动原样集成，仅做 fnOS 打包适配（生命周期脚本、统一网关、桌面入口）",
+          pkg[0])
+    check("L3 第 3 条带 build.py 的 CPython 完整版本号",
+          pkg[1] == f"3.自带 CPython {bu.build.PYTHON_FULL_VERSION} 运行时与全部依赖，安装时无需联网",
+          pkg[1])
+    # 关键约束：日志文案与 changelog 必须逐字一致，否则"日志里看到的"和"包里的"会漂移。
+    entry_lines = bu.changelog_entry("v3.1.6", "3.1.6", "优化在线升级流程").split("<br>")
+    check("L4 日志文案 == changelog 第 2~4 条", entry_lines[2:] == pkg,
+          f"changelog={entry_lines[2:]!r} pkg={pkg!r}")
+    # 回打日志不能因为 write_error/字符问题炸掉（会出现在 Actions 日志里）。
+    # 注意：这里要截的是 bump_upstream.log 自己的 stdout，而不是 bu.log 内部
+    # print 的 stdout —— 检查当前进程的 sys.stdout 是否被替换。
+    # 前面的沙箱（bump()）把 bu.log 静音成 lambda 了，测日志输出前必须还原成
+    # 真正的 build.log，否则截到什么都不是。
+    bu.log = lambda msg: bu.build.log(msg)
+    import io
+    orig_stdout = sys.stdout
+    buf = io.StringIO()
+    sys.stdout = buf
+    try:
+        bu.log_packaging_notes("v3.1.6", "", "3.1.6")
+    finally:
+        sys.stdout = orig_stdout
+    out = buf.getvalue()
+    print(out, end="")  # 回显，失败时能直接看到日志长什么样
+    check("L5 log_packaging_notes 打出第 2 条", pkg[0] in out, out[:120])
+    check("L6 log_packaging_notes 打出第 3 条", pkg[1] in out, out[:120])
+    check("L7 三条打包说明在 Actions 日志里不出现半角分号",
+          all(";" not in line for line in pkg))
+
+    print()
     if FAILS:
         print(f"{len(FAILS)} 项失败: {', '.join(FAILS)}")
         return 1

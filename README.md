@@ -203,6 +203,12 @@ pin 与 `manifest`（`version` + `changelog`）→ 提交 master → 打同名 t
   **当前版本这一条**条目（`tools/bump_upstream.py` 的 `MAX_CHANGELOG_ENTRIES = 1`）。
   changelog 会进包内 manifest 并显示在应用中心，同时又是 Release notes 的来源，越滚越长没有意义；
   所以每次跟进上游都是**整条替换**，而不是把新条目追加到历史条目后面。
+- **Release 正文只显示「版本号 + 第 1 条」**：`build-and-release.yml` 在发布时把 changelog
+  按 `<br>` 切段，只取前两段（`vX.Y.Z` 与本次更新内容），第 2、3 条（上游零改动口径、
+  自带 CPython 运行时离线安装）和第 4 条（自动生成说明）**不进 Release notes**，
+  它们是恒定的打包口径、不是「这个版本变了什么」。应用中心里的 changelog 仍是完整 4 条
+  ——Release 只是发布时的过滤，不改 manifest 源数据。切分口径与 `ENTRY_SPLIT_RE` 一致
+  （`<br><br>` 后紧跟版本号才算条目边界），取不到两行时直接报错而不是发空正文。
 - **更新日志第 1 条会带上上游这次的说明**：脚本会取上游 Release 的「本次更新内容」段，
   清洗成一行塞进第 1 条（如 `1.上游 MoviePilot v3.1.6 更新内容——优化在线升级流程…`）。
   设计要点：
@@ -217,6 +223,13 @@ pin 与 `manifest`（`version` + `changelog`）→ 提交 master → 打同名 t
   - **任何失败都回退到固定文案**（网络/限流/tag 不匹配/正文为空/清洗后为空），
     摘要只是锦上添花，绝不能让每周的发布流程中断。
   - 摘要上限 200 字符（Unicode 字符数），单条 90 字符，最多 3 条。
+- **打包口径（第 2、3 条）在 Actions 日志里也能看到**：`上游源码零改动原样集成…` 与
+  `自带 CPython x.y.z 运行时与全部依赖，安装时无需联网` 这两条以前只存在于 manifest 里，
+  要装完包在应用中心才看得到。现在 `tools/bump_upstream.py` 改完 manifest 后会把**整段更新日志
+  原文回打**到运行日志（`log_packaging_notes()`），`check-upstream.yml` 的 Job Summary 也会在
+  表格下面追加「打包说明」一节。三处（manifest / 运行日志 / Summary）共用
+  `packaging_lines()` 这一份文案、CPython 版本号由 `build.py` 派生，`bump_upstream_smoke.py`
+  的 L 组用例钉住它们逐字一致（避免日志里写的版本与实际打包的版本漂移）。
 - **强制重打当前版本**：手动跑本 workflow 并勾上 `force`（用于验证流水线）。此时 `version`
   已经是目标值，脚本**不会**再动 `changelog`，因此反复重跑也不会往里面塞重复条目。
   （顺带：版本未变时也**不会**去抓上游说明，省一次 API 配额。）

@@ -418,6 +418,58 @@ def set_manifest_key(text, key, value):
     return "".join(lines)
 
 
+def packaging_lines(app_version):
+    """changelog 里「本仓库打包口径」那几条（除第 1 条上游内容以外的全部条目）。
+
+    单独抽出来是为了让 **manifest 的 changelog** 与 **Actions 日志 / Job Summary**
+    共用同一份文案：以前只有 manifest 里有这几条，点开 Actions 的运行日志只能看到
+    「改了哪个文件、打了哪个 tag」，看不到「这个包是怎么来的」——正是第 2、3 条
+    （上游零改动、自带运行时离线安装）在回答的问题。写死两份字符串迟早会漂移，
+    所以这里做唯一来源；check-upstream.yml 的 Summary 也直接 import 本函数取值。
+
+    返回的是纯文本（无 `<br>`），由调用方决定如何拼接 / 加列表符号。
+    `app_version` 目前不参与文案（第 2~4 条不带版本号），保留参数是为了让将来
+    若某条要带版本号时不必再改一遍所有调用点。
+    """
+    return [
+        "2.上游源码零改动原样集成，仅做 fnOS 打包适配（生命周期脚本、统一网关、桌面入口）",
+        f"3.自带 CPython {build.PYTHON_FULL_VERSION} 运行时与全部依赖，安装时无需联网",
+        "4.本条目由 GitHub Actions 定时检查上游后自动生成",
+    ]
+
+
+def log_packaging_notes(upstream_tag, upstream_notes="", app_version=None):
+    """把本次生成的 changelog 全文打到终端（即 Actions 运行日志）里。
+
+    以前 Actions 日志里只有「改了哪个文件、打了哪个 tag」，用户点开日志看不到
+    「这个包是怎么来的」——「上游零改动」「自带运行时、离线安装」这两条只存在于
+    manifest 内部，要装完包才能在应用中心看到。这里在改完 manifest 后回打一遍，
+    让日志和 Job Summary 都能直接看到与包内完全一致的更新日志。
+    """
+    version = app_version or manifest_version(read_manifest())
+    log("")
+    log(" 本次更新日志（与包内 manifest / Release notes 逐字一致）:")
+    log(f"   v{version}")
+    log("   " + changelog_first_line(upstream_tag, upstream_notes))
+    for line in packaging_lines(app_version):
+        log("   " + line)
+    # build.log 刻意写成 `print(msg)`（不用默认参数 sys.stdout=sys.stdout），所以
+    # 测试里临时替换 sys.stdout 能截获输出；这里顺带把缓冲区刷掉，Actions 实时日志
+    # 才不会把这段跟后续输出乱序。
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def changelog_first_line(upstream_tag, upstream_notes=""):
+    """changelog 第 1 条：拿到上游摘要就写摘要，否则回退成固定文案。"""
+    if upstream_notes:
+        return f"1.上游 MoviePilot {upstream_tag} 更新内容——{upstream_notes}"
+    return (f"1.跟进上游 MoviePilot {upstream_tag}：构建 pin 与 manifest 版本同步更新，"
+            f"包名版本与上游 tag 一一对应")
+
+
 def changelog_entry(upstream_tag, app_version, upstream_notes=""):
     """生成新版本的 changelog 条目（单条，不累积）。
 
@@ -425,24 +477,15 @@ def changelog_entry(upstream_tag, app_version, upstream_notes=""):
       - 拿到上游 Release 摘要时，写「上游 <tag> 更新内容——<摘要>」；
       - 拿不到（网络/限流/tag 不匹配/正文为空）时，回退成本仓库视角的固定文案。
 
-    第 2~4 条固定描述本仓库的打包口径，与上游说明无关，两种情况都一样。
+    第 2~4 条固定描述本仓库的打包口径，由 packaging_lines() 提供 —— 同一份文案
+    也会出现在 Actions 日志与 Job Summary 里，两处必须逐字一致。
 
     `upstream_notes` 必须是已经过 sanitize_notes 的文本 —— 直接拼原始 body 会把
     半角分号带进 manifest，进而让 fnpack 截断取值、job 失败。
     """
-    if upstream_notes:
-        first = f"1.上游 MoviePilot {upstream_tag} 更新内容——{upstream_notes}"
-    else:
-        first = (f"1.跟进上游 MoviePilot {upstream_tag}：构建 pin 与 manifest 版本同步更新，"
-                 f"包名版本与上游 tag 一一对应")
-
-    return (
-        f"v{app_version}<br>"
-        f"{first}<br>"
-        f"2.上游源码零改动原样集成，仅做 fnOS 打包适配（生命周期脚本、统一网关、桌面入口）<br>"
-        f"3.自带 CPython {build.PYTHON_FULL_VERSION} 运行时与全部依赖，安装时无需联网<br>"
-        f"4.本条目由 GitHub Actions 定时检查上游后自动生成"
-    )
+    parts = [f"v{app_version}", changelog_first_line(upstream_tag, upstream_notes)]
+    parts += packaging_lines(app_version)
+    return "<br>".join(parts)
 
 
 def bump_manifest(upstream_tag, app_version, upstream_notes=""):
@@ -594,6 +637,8 @@ def main():
     log("")
     log(f" 完成：上游 {target_tag}，应用版本 {app_version}"
         f"{'，manifest 已更新' if changed else '，manifest 版本未变'}")
+    # 放在自证之后：文案此时才确定（上游摘要可能为空 → 回退文案）。
+    log_packaging_notes(target_tag, notes)
 
 
 if __name__ == "__main__":

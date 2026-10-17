@@ -204,6 +204,11 @@ jobs:
           APP_VERSION: ${{ steps.check.outputs.app_version }}
           TAG: ${{ steps.check.outputs.tag }}
         run: |
+          # 「打包口径」的唯一来源是 tools/bump_upstream.py 的 packaging_lines()
+          # （CPython 版本号由 build.py 派生，不能在 YAML 里再写死一份）。这里直接
+          # import 脚本取值；取不到时退回空串 —— Summary 本身绝不能把 job 弄挂
+          # （它挂了会掩盖真正的失败原因），所以整个取值为失败容忍。
+          PY_PKG=$(python3 -c 'import sys; sys.path.insert(0, "tools"); import bump_upstream as bu; print("\n".join(bu.packaging_lines("")))' 2>/dev/null || true)
           {
             echo "## 上游检查结果"
             echo
@@ -214,4 +219,10 @@ jobs:
             echo "| 上游 tag | \`${UPSTREAM_TAG:-n/a}\` |"
             echo "| 应用版本 | \`${APP_VERSION:-n/a}\` |"
             echo "| 发布 tag | \`${TAG:-n/a}\` |"
+            if [ -n "$PY_PKG" ]; then
+              echo
+              echo "### 打包说明"
+              echo
+              echo "$PY_PKG" | sed 's/^/- /'
+            fi
           } >> $GITHUB_STEP_SUMMARY
