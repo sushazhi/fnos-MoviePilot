@@ -1,5 +1,5 @@
 appname               = moviepilot
-version               = 3.1.5
+version               = 3.1.6
 display_name          = MoviePilot
 desc                  = <b>NAS 媒体库自动化管理工具</b>，支持订阅、搜索、下载、媒体整理与刮削、媒体库刷新及消息通知等核心自动化流程。<br><br>🎬 <b>原生应用：</b>内置 Python 后端与 Web 前端，前后端运行于本地，通过 fnOS 统一网关嵌入桌面访问。
 
@@ -31,4 +31,4 @@ desktop_applaunchname = moviepilot.Application
 install_dep_apps      = nodejs_v24
 
 # 更新日志
-changelog             = v3.1.5<br>1.跟进上游 MoviePilot v3.1.5：构建 pin 与 manifest 版本同步更新，包名版本与上游 tag 一一对应<br>2.上游源码零改动原样集成，仅做 fnOS 打包适配（生命周期脚本、统一网关、桌面入口）<br>3.自带 CPython 3.14.8 运行时与全部依赖，安装时无需联网<br>4.本条目由 GitHub Actions 定时检查上游后自动生成
+changelog             = v3.1.6<br>1.上游 MoviePilot v3.1.6 更新内容——优化在线升级流程：主程序、配套前端和站点资源统一准备，全部就绪后只需重启一次；改进更新状态保留和移动端按钮布局；新增整理成功通知聚合开关，同批次文件整理完成后汇总通知，并支持自定义通知模板，减少逐文件刷屏；升级多渠道消息展示：按渠道能力呈现结构化通知，保留纯文本兼容；修复 Telegram 富消息降级、飞书流式卡片过期恢复及微信 ClawBot 媒体消息识别<br>2.上游源码零改动原样集成，仅做 fnOS 打包适配（生命周期脚本、统一网关、桌面入口）<br>3.自带 CPython 3.14.8 运行时与全部依赖，安装时无需联网<br>4.本条目由 GitHub Actions 定时检查上游后自动生成
