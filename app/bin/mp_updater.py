@@ -61,6 +61,8 @@ MoviePilot fnOS 应用自更新器（重启即升级）
 
 注意：加速前缀只作用于 github.com 系 URL（归档下载、网页兜底版本发现）。
 api.github.com 一律直连，不走加速（镜像对它的支持参差不齐）。
+直连 → 加速是**顺序降级**：直连排第一，且有加速前缀可退时只给
+DIRECT_ATTEMPT_TIMEOUT（8s）判死，避免黑洞式直连挂满完整超时白等（见 _candidate_urls）。
 """
 from __future__ import annotations
 
@@ -139,6 +141,18 @@ UA = "moviepilot-fnos-updater"
 DISCOVERY_TIMEOUT = 10
 # 直连 api.github.com 只有一次机会（没有加速通道可退），给足时间
 API_TIMEOUT = 15
+# 直连尝试的超时上限（有加速前缀可退时才生效）。
+# 受限网络里直连 github.com 系域名常是**黑洞**：连接/等响应头阶段不回包也不发 RST，
+# 一次尝试会一路挂满调用方给的完整超时（大文件下载 60s、每个发现通道 10s）——更新
+# 日志里直连 dist.zip 正是 `<urlopen error timed out>` 白等 60s 才降级，而镜像 4s
+# 就拉完了同一份 39.8MB。这里给直连这一次设个短上限，判死即交给镜像。
+#
+# 若直连其实是"能连、只是慢"，这个值也不会误杀：socket 超时只在**完全收不到数据**
+# 时才触发，还在流动的连接不会被 8s 切断；被切掉的只有"连上却不再给数据"的假死，
+# 那种情况交给镜像本来就更划算（实测直连 0.2MB/s vs 镜像约 10MB/s）。
+#
+# DIRECT_ONLY（api.github.com）没有可退通道，绝不缩短（见 _candidate_urls）。
+DIRECT_ATTEMPT_TIMEOUT = 8
 # 四级通道 × 各 1~3 个前缀，最坏情况要留够 —— 预算太小会把"最后那级能用的通道"
 # 直接饿死（它恰恰是受限网络里最可能成功的一级）
 DISCOVERY_BUDGET = 120
@@ -433,8 +447,36 @@ def save_state(cfg: Config, state: dict) -> None:
 # ---------------------------------------------------------------------------
 # 网络（github.com 系 URL：直连 -> 加速；api.github.com：只直连）
 # ---------------------------------------------------------------------------
-def _candidate_urls(url: str, proxies: tuple) -> list:
-    return [url] + [f"{p}{url}" for p in proxies]
+def _mirror_host(mirror: str) -> str:
+    """`https://gh.dpik.top/` → `gh.dpik.top`（日志与 pip --trusted-host 共用）。"""
+    return mirror.split("//", 1)[-1].split("/", 1)[0]
+
+
+def _candidate_urls(url: str, proxies: tuple, timeout: int) -> list:
+    """返回本轮要尝试的 [(URL, 该次尝试的超时秒数, 通道名)]：直连第一，加速前缀依次跟在后面。
+
+    通道名只为日志服务（`直连` / `加速(gh.dpik.top)`）：更新日志里"下载完成 xxx（39.8 MB）"
+    这种行看不出到底走的直连还是镜像，正是"重启自更新里没有用加速源么"这句话的由来。
+    前缀语法是 `https://镜像/原始URL`，所以从候选 URL 反推通道也不难，但让候选自己带上
+    标签能保证"记下来的就是真正请求的那条"，不会在调用点算错。
+
+    proxies 为空（DIRECT_ONLY，api.github.com）时只有直连一个候选，保持调用方给的
+    完整超时 —— 那一次没有退路，必须给足，绝不缩短。
+
+    有加速前缀可退时，直连那一次只给 DIRECT_ATTEMPT_TIMEOUT。urlopen 的 timeout 覆盖
+    **连接 / TLS 握手 / 等响应头**这三个阶段，也正是实测故障发生的地方：更新日志里
+    直连 dist.zip 报的是 `<urlopen error timed out>`，从头到尾挂满 60s 才降级，而
+    镜像 4s 就拉完了同一份 39.8MB。8s 足够判定"这条直连没戏"，之后立刻交给镜像。
+
+    加速候选仍用调用方给的完整超时，镜像慢一点不会被误杀。
+
+    对**传输阶段**的影响可以忽略：同一个 timeout 只在"完全收不到数据"时才触发，
+    还在流动的连接不会被切断 —— 被切掉的只有连上却不再给数据的假死，正该降级。
+    """
+    if not proxies:
+        return [(url, timeout, "直连")]
+    return ([(url, min(timeout, DIRECT_ATTEMPT_TIMEOUT), "直连")]
+            + [(f"{p}{url}", timeout, f"加速({_mirror_host(p)})") for p in proxies])
 
 
 def _budget_exhausted(deadline) -> bool:
@@ -443,7 +485,7 @@ def _budget_exhausted(deadline) -> bool:
 
 def http_json(url: str, proxies: tuple, timeout: int = DISCOVERY_TIMEOUT, deadline=None):
     """GET 一个 JSON。proxies 传空元组（DIRECT_ONLY）表示只直连、不加加速前缀。"""
-    for u in _candidate_urls(url, proxies):
+    for u, t, label in _candidate_urls(url, proxies, timeout):
         if _budget_exhausted(deadline):
             log("  版本发现已超出时间预算，停止尝试")
             return None
@@ -451,10 +493,10 @@ def http_json(url: str, proxies: tuple, timeout: int = DISCOVERY_TIMEOUT, deadli
             req = urllib.request.Request(
                 u, headers={"User-Agent": UA,
                             "Accept": "application/vnd.github+json"})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=t) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except Exception as e:  # noqa: BLE001 - 逐个降级，最后统一报错
-            log(f"  请求失败 {u}: {e}")
+            log(f"  请求失败 [{label}] {u}: {e}")
     return None
 
 
@@ -468,7 +510,7 @@ def fetch_text(url: str, proxies: tuple, timeout: int = DISCOVERY_TIMEOUT,
 
     注意不要加 Accept-Encoding：urllib 不会自动解压，带上就得自己解 gzip。
     """
-    for u in _candidate_urls(url, proxies):
+    for u, t, label in _candidate_urls(url, proxies, timeout):
         if _budget_exhausted(deadline):
             log("  版本发现已超出时间预算，停止尝试")
             return None, None
@@ -476,14 +518,14 @@ def fetch_text(url: str, proxies: tuple, timeout: int = DISCOVERY_TIMEOUT,
             req = urllib.request.Request(u, headers={
                 "User-Agent": UA,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=t) as resp:
                 final = resp.geturl()
                 text = resp.read(limit).decode("utf-8", errors="replace")
             if text.strip():
                 return final, text
-            log(f"  响应为空 {u}")
+            log(f"  响应为空 [{label}] {u}")
         except Exception as e:  # noqa: BLE001
-            log(f"  请求失败 {u}: {e}")
+            log(f"  请求失败 [{label}] {u}: {e}")
     return None, None
 
 
@@ -491,10 +533,10 @@ def download_file(url: str, dest: Path, proxies: tuple, timeout: int = 60) -> bo
     """下载到 .part 再原子改名，避免中断留下残缺文件被当成完整包。"""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".part")
-    for u in _candidate_urls(url, proxies):
+    for u, t, label in _candidate_urls(url, proxies, timeout):
         try:
             req = urllib.request.Request(u, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=timeout) as resp, open(tmp, "wb") as f:
+            with urllib.request.urlopen(req, timeout=t) as resp, open(tmp, "wb") as f:
                 total = int(resp.headers.get("Content-Length") or 0)
                 done = 0
                 mark = 0
@@ -511,10 +553,10 @@ def download_file(url: str, dest: Path, proxies: tuple, timeout: int = 60) -> bo
             if not tmp.exists() or tmp.stat().st_size == 0:
                 raise UpdateError("下载结果为空")
             tmp.replace(dest)
-            log(f"  下载完成 {dest.name}（{dest.stat().st_size / 1048576:.1f} MB）")
+            log(f"  下载完成 {dest.name}（{dest.stat().st_size / 1048576:.1f} MB，{label}）")
             return True
         except Exception as e:  # noqa: BLE001
-            log(f"  下载失败 {u}: {e}")
+            log(f"  下载失败 [{label}] {u}: {e}")
             try:
                 tmp.unlink()
             except OSError:
@@ -861,10 +903,6 @@ def refresh_lock_file(cfg: Config, new_root: Path, base: dict) -> int:
         log(f"警告: 刷新 requirements.lock.txt 失败: {e}")
         return 0
     return len(lines) - 1
-
-
-def _mirror_host(mirror: str) -> str:
-    return mirror.split("//", 1)[-1].split("/", 1)[0]
 
 
 # pip 找不到某个**具体版本**时的报错（两种措辞：新版 pip 报 No matching distribution，

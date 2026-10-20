@@ -157,6 +157,10 @@ python build.py --with-runtime --no-build
 
 > 下载策略：**先直连 GitHub，直连不通再按内置加速前缀列表依次降级**（`gh.dpik.top` → `v4.gh-proxy.org`，见 `build.py` 的 `PROXIES`），避免 GitHub 被限时卡死。
 > ⚠️ 本机实测直连 `github.com` 已完全不可用（归档 zip / Release / raw 全部超时），加速前缀是当前唯一可用的下载通道。
+> 运行时自更新（`mp_updater.py`）同理：有加速前缀可退时，**直连那次只给 8 秒**
+> （`DIRECT_ATTEMPT_TIMEOUT`）判死就交给镜像，不再挂满完整超时白等（下载 60s、
+> 版本发现每通道 10s）。`api.github.com` 没有可退通道，仍是完整超时、不缩短。
+> 日志里成功行与失败行都会注明本次走的是 `直连` 还是 `加速(gh.dpik.top)` 之类的通道。
 
 ### GitHub Actions 自动构建（分架构 + 自带 Python 运行时）
 
@@ -509,7 +513,8 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 > python -c "import tarfile,io;t=tarfile.open('moviepilot-x.y.z-amd64.fpk','r:gz');print(sum(1 for m in tarfile.open(fileobj=io.BytesIO(t.extractfile('app.tgz').read()),mode='r:gz') if m.issym()))"
 > ```
 > 排查装包升级耗时，看 `TRIM_PKGVAR` 下的三份日志：`upgrade.log`（停服务 / 备份模式 /
-> 迁移 / 重启）、`install.log`（依赖安装）、`update.log`（联网检查与下载，每行带完整 URL）。
+> 迁移 / 重启）、`install.log`（依赖安装）、`update.log`（联网检查与下载，每行带完整 URL，
+> 并标注实际通道 `直连` / `加速(镜像域名)` 与本次尝试的超时）。
 
 ## 已知假设与限制
 

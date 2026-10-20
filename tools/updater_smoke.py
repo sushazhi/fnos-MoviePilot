@@ -15,7 +15,8 @@
   D 纯函数：版本比较、uv.lock 解析、依赖计划
   E/F 真实网络（可选，不可达时 SKIP）
   G 命令行参数契约
-  H 版本发现降级链（API / 网页 latest / atom / 分支 version.py）与镜像配置（离线打桩）
+  H 版本发现降级链（API / 网页 latest / atom / 分支 version.py）、镜像配置与
+    直连超时上限（离线打桩）
   I 依赖清单的平台 marker 过滤（pyobjc-* 等其他平台专属包不得进安装计划）
   J 源上不可得的版本：本机已装则跳过继续，本机未装则仍然失败
 """
@@ -467,6 +468,129 @@ def scenario_h():
           all("gh-proxy.org" not in p or p == "https://v4.gh-proxy.org/"
               for p in mod.DEFAULT_PROXIES),
           str(mod.DEFAULT_PROXIES))
+
+    # --- 直连超时上限 + 日志写明通道（H22~H31）-----------------------------
+    # 真实故障：受限网络里直连 github.com 不回包也不发 RST，前端 dist.zip 的直连
+    # 尝试白等满 60s（日志里的 `<urlopen error timed out>`）才降级到镜像，而镜像
+    # 4s 就拉完了同一份 39.8MB。契约：有加速前缀可退时，直连那次只给
+    # DIRECT_ATTEMPT_TIMEOUT；加速候选仍拿调用方的完整超时；DIRECT_ONLY
+    # （api.github.com 只有一次机会）绝不缩短。
+    #
+    # 另一半是"看得出来"：日志里只写"下载完成 frontend.zip（39.8 MB）"时，
+    # 没人能判断到底走的直连还是镜像 —— 这正是"重启自更新里没有用加速源么"的由来。
+    MIRRORS = ("https://gh.dpik.top/", "https://v4.gh-proxy.org/")
+    GH = "https://github.com/jxxghp/MoviePilot-Frontend/releases/download/v3.1.6/dist.zip"
+    base = mod._candidate_urls(GH, MIRRORS, 60)
+    check("H22 直连候选被限时、加速候选拿完整超时",
+          base == [(GH, mod.DIRECT_ATTEMPT_TIMEOUT, "直连"),
+                   ("https://gh.dpik.top/" + GH, 60, "加速(gh.dpik.top)"),
+                   ("https://v4.gh-proxy.org/" + GH, 60, "加速(v4.gh-proxy.org)")],
+          str(base))
+
+    # 上限必须真的比"完整超时"短，否则等于没改。下载默认 60s、发现默认 10s，
+    # 都要被压下来。
+    check("H23 直连上限短于下载(60s)与发现(10s)的完整超时",
+          0 < mod.DIRECT_ATTEMPT_TIMEOUT < mod.DISCOVERY_TIMEOUT
+          and mod.DIRECT_ATTEMPT_TIMEOUT < 60,
+          f"cap={mod.DIRECT_ATTEMPT_TIMEOUT} discovery={mod.DISCOVERY_TIMEOUT} dl=60")
+
+    # 调用方自己给得更短的超时不能被抬高（min 语义）。
+    check("H24 调用方更短超时优先（min 语义）",
+          [(u, t) for u, t, _l in mod._candidate_urls(GH, MIRRORS, 3)]
+          == [(GH, 3), ("https://gh.dpik.top/" + GH, 3),
+              ("https://v4.gh-proxy.org/" + GH, 3)],
+          str(mod._candidate_urls(GH, MIRRORS, 3)))
+
+    check("H25 DIRECT_ONLY 不缩短（api 只有一次机会）",
+          mod._candidate_urls("https://api.github.com/x", mod.DIRECT_ONLY,
+                              mod.API_TIMEOUT) == [("https://api.github.com/x",
+                                                    mod.API_TIMEOUT, "直连")],
+          str(mod._candidate_urls("https://api.github.com/x", mod.DIRECT_ONLY,
+                                  mod.API_TIMEOUT)))
+
+    # 端到端：真正调用 download_file，记录每次尝试用的 timeout —— 只看
+    # _candidate_urls 的返回值测不出"调用方忘了把 t 传下去"这种错。
+    real_urlopen = mod.urllib.request.urlopen
+    tries = []
+
+    def fake_urlopen(req, timeout=None, **kw):
+        tries.append((getattr(req, "full_url", str(req)), timeout))
+        raise OSError("smoke: 无网络")
+
+    mod.urllib.request.urlopen = fake_urlopen
+    try:
+        ok = mod.download_file(GH, SANDBOX / "_probe" / "dist.zip", MIRRORS, timeout=60)
+        check("H26 下载全程失败返回 False", ok is False, str(ok))
+        check("H27 下载三次尝试的超时 = 直连上限/完整/完整",
+              [t for _u, t in tries] == [mod.DIRECT_ATTEMPT_TIMEOUT, 60, 60], str(tries))
+        check("H28 下载尝试顺序 = 直连 → 镜像（顺序即降级顺序）",
+              [u for u, _t in tries] == [GH, "https://gh.dpik.top/" + GH,
+                                         "https://v4.gh-proxy.org/" + GH],
+              str([u for u, _t in tries]))
+    finally:
+        mod.urllib.request.urlopen = real_urlopen
+
+    # 成功行必须带上实际通道。用假响应让"直连"和"镜像"分别成功一次，直接读日志。
+    class _FakeResp:
+        def __init__(self, body):
+            self._body = body
+            self.headers = {"Content-Length": str(len(body))}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, n=-1):
+            if not self._body:
+                return b""
+            if n is None or n < 0:
+                out, self._body = self._body, b""
+                return out
+            out, self._body = self._body[:n], self._body[n:]
+            return out
+
+    real_log = mod.log
+    captured = []
+
+    def capture(msg):
+        captured.append(str(msg))
+        real_log(msg)
+
+    mod.log = capture
+    try:
+        mod.urllib.request.urlopen = lambda req, timeout=None, **k: _FakeResp(b"d" * 2048)
+        direct_ok = mod.download_file(GH, SANDBOX / "_probe" / "d.zip", MIRRORS, timeout=60)
+        direct_lines = [m for m in captured if "下载完成" in m]
+
+        captured.clear()
+        calls = {"n": 0}
+
+        def mirror_ok(req, timeout=None, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:               # 直连失败，镜像成功
+                raise OSError("smoke: 直连超时")
+            return _FakeResp(b"m" * 2048)
+
+        mod.urllib.request.urlopen = mirror_ok
+        mirror_ok_done = mod.download_file(GH, SANDBOX / "_probe" / "m.zip", MIRRORS,
+                                           timeout=60)
+        mirror_lines = [m for m in captured if "下载完成" in m]
+        fail_lines = [m for m in captured if "下载失败" in m]
+    finally:
+        mod.urllib.request.urlopen = real_urlopen
+        mod.log = real_log
+        shutil.rmtree(SANDBOX / "_probe", ignore_errors=True)
+
+    check("H29 直连成功时成功行写明“直连”",
+          direct_ok and direct_lines and "直连" in direct_lines[-1], str(direct_lines))
+    check("H30 镜像成功时成功行写明具体镜像",
+          mirror_ok_done and mirror_lines and "加速(gh.dpik.top)" in mirror_lines[-1],
+          str(mirror_lines))
+    check("H31 失败行也标注通道（并保留完整 URL）",
+          bool(fail_lines) and "直连" in fail_lines[0] and GH in fail_lines[0],
+          str(fail_lines))
 
     # API 必须只直连：带上加速前缀时，不转发 api 的镜像会挂到 SSL 握手超时而不是
     # 快速报错，白白拖长启动路径的更新检查（实测 ghfast.top / gh-proxy.org）。
