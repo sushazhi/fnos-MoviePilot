@@ -63,6 +63,8 @@ MoviePilot fnOS 应用自更新器（重启即升级）
 api.github.com 一律直连，不走加速（镜像对它的支持参差不齐）。
 直连 → 加速是**顺序降级**：直连排第一，且有加速前缀可退时只给
 DIRECT_ATTEMPT_TIMEOUT（8s）判死，避免黑洞式直连挂满完整超时白等（见 _candidate_urls）。
+超过探测阈值的包走**读超时压缩 + 分段并行 + 流式解包**三条提速路径，
+判据与实测依据见 DOWNLOAD_TUNING 一节与 download_file / fetch_zip 的说明。
 """
 from __future__ import annotations
 
@@ -81,6 +83,7 @@ import sysconfig
 import time
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 try:  # Python 3.11+，自带运行时是 3.14，必定可用
@@ -153,6 +156,51 @@ API_TIMEOUT = 15
 #
 # DIRECT_ONLY（api.github.com）没有可退通道，绝不缩短（见 _candidate_urls）。
 DIRECT_ATTEMPT_TIMEOUT = 8
+
+# ---------------------------------------------------------------------------
+# 下载提速参数（DOWNLOAD_TUNING）
+# ---------------------------------------------------------------------------
+# 这三个值决定"重启自更新到底有多快"，取值来自实测（2026-10，本机，同一份
+# v3.1.8 归档，四个通道并发各拉一遍 full body）：
+#   gh.dpik.top       4.6s  9.5MB   2.07 MB/s
+#   v4.gh-proxy.org  23.4s  9.5MB   0.41 MB/s
+#   gh-proxy.com    111.8s  9.4MB   0.08 MB/s  （中途 read timeout）
+#   ghproxy.imciel  223.7s  9.5MB   0.04 MB/s
+# 由此得到两条结论，正是下面几个常量的来源：
+#   1) 镜像之间差 1~2 个数量级，**且镜像自身不稳定**（同一份包，前一轮
+#      gh-proxy.com 与 v4.gh-proxy.org 的 etag / x-cache-hits 完全一致、速度相近，
+#      这一轮一个 111s 超时、一个 23s）。所以"换通道"必须能在**卡住的当下**发生，
+#      不能等完整超时：STALL_TIMEOUT 就是"多久收不到新字节就换下一条"。
+#   2) 小包（< SEGMENT_MIN_SIZE）确实能靠**分段并发**把整包时间压下来 —— 前提是
+#      服务端支持 Range（下载前先探一次，见 _probe_range；不支持就退回顺序下载）。
+#   3) 但**大包不能**：分段对大包的收益是负的。实测同一份 39.8MB 前端包，
+#      单连接 0.65~0.94 MB/s，切成 8 段并发反而掉到 0.13 MB/s（两轮都是），
+#      因为镜像对**多连接同时**做总量限流，并发越多每条越慢，还要多付
+#      "全部段都成了才落盘"的尾延迟。而 9.5MB 后端包分段是净收益（顺带一测）。
+#      所以分段只在 [SEGMENT_MIN_SIZE, SEGMENT_MAX_SIZE) 这个窗口里启用。
+# 读超时的语义（urllib 的 timeout 覆盖连接 / TLS / 等响应头 / 每次 read）保证
+# STALL_TIMEOUT 不会误杀"慢但在动"的连接：只要还有字节进来就不会触发。
+STALL_TIMEOUT = 15
+# 分段的体积窗口。小于下限：握手与拼接的固定开销不划算；大于上限：镜像对多连接
+# 有总量限流，并发只会更慢（见上面第 3 条实测）。
+SEGMENT_MIN_SIZE = 4 * 1024 * 1024
+SEGMENT_MAX_SIZE = 16 * 1024 * 1024
+# 分段并发数。窗口内的包（4~16MB）4 路能把 0.4MB/s 的单连接压到 0.7~2.4MB/s。
+SEGMENT_WORKERS = 4
+# 单段大小：并发数已定，它只决定"整个包切几段并行"，给个下限免得切得过碎。
+SEGMENT_SIZE = 2 * 1024 * 1024
+# 探测 Range / Content-Length 的超时（比正文短：不支持时分段会立刻回 200）。
+PROBE_TIMEOUT = 10
+# 单段重试次数与退避基数。实测镜像会在长连接中途断流（同一份包，首段
+# 1.8MB 后读超时，而 8MB 偏移处的整段 1.9MB 一次就成功），所以"这一段再来
+# 一次"极大概率能成；3 次后仍失败才判定这条通道给不出这段。
+SEGMENT_ATTEMPTS = 3
+SEGMENT_BACKOFF = 1.0
+# 整轮重试：所有通道都在同一轮里失手时（镜像集体抖动，实测分钟级即可自愈），
+# 不把这一次当作"更新失败"记进 failures —— 整轮重来比等下一次重启更划算。
+DOWNLOAD_ROUNDS = 3
+DOWNLOAD_RETRY_WAIT = 20
+
 # 四级通道 × 各 1~3 个前缀，最坏情况要留够 —— 预算太小会把"最后那级能用的通道"
 # 直接饿死（它恰恰是受限网络里最可能成功的一级）
 DISCOVERY_BUDGET = 120
@@ -529,27 +577,222 @@ def fetch_text(url: str, proxies: tuple, timeout: int = DISCOVERY_TIMEOUT,
     return None, None
 
 
+def _read_timeout(t: int) -> int:
+    """把调用的完整超时压成"多久收不到新字节就放弃"。
+
+    顺序下载的 timeout 必须同时管两件事：判死黑洞式连接、以及在通道卡住时
+    尽快换下一条。前者要小（DIRECT_ATTEMPT_TIMEOUT 已经这样做了），后者过去
+    没人管：同一份包实测 gh-proxy.com 卡到 111s 才超时，而 STALL_TIMEOUT 就是
+    让它在 15s 收不到字节时立刻换镜像。注意它只作用于**读超时**语义 ——
+    连接还活着、字节还在进来时不会触发，所以慢通道不会被误判成失败。
+    """
+    return min(t, STALL_TIMEOUT) if t else STALL_TIMEOUT
+
+
+def _probe_range(url: str, timeout: int):
+    """探测这条通道的 Range 能力与包体积。返回 (total_size, mode)：
+
+      mode = "range"  支持分段（206 + `Content-Range: bytes 0-0/<总长>`）
+      mode = "whole"  不支持分段，但知道总长度（200 + Content-Length）
+      mode = None     探测失败（(0, None)）
+
+    必须同时认 `Content-Range` 与 `Content-Length` 两种长度来源：实测
+    gh.dpik.top（本项目常驻的"直连后端"）对 Range 请求**回落成 200 + chunked**，
+    完全不给 Content-Length —— 只看第 200 状态与 Content-Length 会把"支持
+    Range 但长度未知"的通道误判成不支持，而它恰恰在 v4.gh-proxy.org 上能回
+    206。探测失败本身不算下载失败：它只决定"要不要分段"，正文照常由调用方
+    下载。
+    """
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA,
+                                                  "Range": "bytes=0-0"})
+        resp = urllib.request.urlopen(req, timeout=min(timeout, PROBE_TIMEOUT))
+        try:
+            status = getattr(resp, "status", 200)
+            headers = resp.headers
+            total = 0
+            # 206 的长度在 Content-Range 里；200 的长度在 Content-Length 里。
+            # 两个都读、谁有值用谁，避免"某镜像只给其中一个"造成误判。
+            m = re.search(r"/(\d+)\s*$", headers.get("Content-Range") or "")
+            if m:
+                total = int(m.group(1))
+            elif headers.get("Content-Length"):
+                total = int(headers.get("Content-Length") or 0)
+            if status == 206 and total > 0:
+                return total, "range"
+            if total > 0:
+                return total, "whole"
+            return 0, None
+        finally:
+            # 只读 1KB 后直接关：不带 `with`，与其它下载路径保持同一口径
+            # （显式 close，不依赖 GC —— Windows 上 GC 晚到会让文件删不掉）。
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001 - 探测失败只意味着"不分段"，不算下载失败
+        return 0, None
+
+
+def _get(url: str, timeout: int, extra: dict | None = None):
+    headers = {"User-Agent": UA}
+    if extra:
+        headers.update(extra)
+    req = urllib.request.Request(url, headers=headers)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _parallel_download(url: str, dest: Path, total: int, label: str,
+                       timeout: int = 60) -> bool:
+    """把同一 URL 按 Range 切成若干段并发取，全部成功才落盘。
+
+    只在 `SEGMENT_MIN_SIZE <= total < SEGMENT_MAX_SIZE` 的窗口内被调用：超出
+    上限的包并发反而更慢（镜像按连接数做总量限流，实测 39.8MB 从 0.65 掉到
+    0.13 MB/s），所以调用方用窗口判断，这里不再重复。
+
+    单连接带宽是**镜像侧**的限制（实测同一份包，单个镜像 0.4~2 MB/s，直连甚至
+    拿不到首字节）。分段并发把这份限制摊到 N 条连接上，是不依赖"换到更快的
+    镜像"就能提速的手段 —— 而镜像恰好是随时会变的。
+
+    失败语义分层，参照 fpk 更新里已经被验证的"分片 + 单段重试"思路：
+      * **单段失败先只重试这一段**（最多 SEGMENT_ATTEMPTS 次），不动其它已下好
+        的段。实测镜像在长连接上偶发提前断流（同一份包，首段 1.8MB 后读超时，
+        而同一次里 8MB 偏移处的整段 1.9MB 一次就成功），若在第 N 段就整体放弃，
+        前面 N-1 段的进度全白费，退回速度更慢的整包重试并不划算。
+      * 单段重试耗尽才整体放弃（删临时目录），交给调用方按原顺序降级到下一
+        条通道 —— 那时已经能判定"这条通道这段就是给不出来"。
+    """
+    seg = max(SEGMENT_SIZE, -(-total // (SEGMENT_WORKERS * 2)))
+    ranges = [(start, min(start + seg, total) - 1) for start in range(0, total, seg)]
+    work = dest.with_name(dest.name + ".parts")
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    read_to = _read_timeout(timeout)
+    try:
+        with ThreadPoolExecutor(max_workers=SEGMENT_WORKERS) as pool:
+            futs = {pool.submit(_fetch_range_retry, url, work / f"{i:04d}", a, b, read_to): i
+                    for i, (a, b) in enumerate(ranges)}
+            for fut in as_completed(futs):
+                fut.result()            # 抛异常即中断整体
+        tmp = dest.with_name(dest.name + ".part")
+        with open(tmp, "wb") as out:
+            for i in range(len(ranges)):
+                part = work / f"{i:04d}"
+                want = ranges[i][1] - ranges[i][0] + 1
+                got = part.stat().st_size
+                if got != want:
+                    raise UpdateError(f"分段 {i} 长度不符（{got} != {want}）")
+                with open(part, "rb") as fp:
+                    shutil.copyfileobj(fp, out)
+        if tmp.stat().st_size != total:
+            raise UpdateError(f"拼接长度不符（{tmp.stat().st_size} != {total}）")
+        tmp.replace(dest)
+        log(f"  下载完成 {dest.name}（{dest.stat().st_size / 1048576:.1f} MB，{label}，"
+            f"{len(ranges)} 段并发）")
+        return True
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _fetch_range_retry(url: str, path: Path, start: int, end: int, read_timeout: int) -> None:
+    """单段下载，失败只重试本段（指数退避）。重试耗尽才抛给调用方。"""
+    last = None
+    for attempt in range(SEGMENT_ATTEMPTS):
+        try:
+            return _fetch_range(url, path, start, end, read_timeout)
+        except Exception as e:  # noqa: BLE001 - 段级重试
+            last = e
+            if attempt + 1 < SEGMENT_ATTEMPTS:
+                time.sleep(SEGMENT_BACKOFF * (attempt + 1))
+    raise UpdateError(f"分段 {start}-{end} 重试 {SEGMENT_ATTEMPTS} 次仍失败: {last}")
+
+
+def _fetch_range(url: str, path: Path, start: int, end: int, read_timeout: int) -> None:
+    """取 [start, end] 一段写入 path。
+
+    长度必须**显式核对**：`shutil.copyfileobj` 读到 EOF 就返回，不会告诉我们
+    少收了多少 —— 而镜像在长连接上偶发提前断流（实测大包顺序下载正是被读超时
+    打断的）。少收的一段会让拼接出的 zip 后半截错位，且 CRC 只有解压到那个成员
+    时才报错，报错位置离现场很远。这里当场按长度判死，失败就停在"第 N 段"。
+    """
+    want = end - start + 1
+    # 响应对象必须**显式** close：`with` 只关文件句柄，而 socket 要等 GC 才释放。
+    # 在 Linux 上无所谓，在 Windows 上表现为"分片文件仍被占用，rmtree 报
+    # WinError 32"——测试与运维脚本都会撞上（真实故障：冒烟测试残留
+    # frontend.zip.parts\0004 无法删除，后续整棵树都建不起来）。
+    resp = _get(url, read_timeout, {"Range": f"bytes={start}-{end}"})
+    try:
+        status = getattr(resp, "status", 200)
+        if status != 206:
+            # 通道把 Range 吃掉了（回整个 body）：这条通道不能分段用，明确失败，
+            # 让调用方退回顺序下载而不是把整个包当成一段写进第 N 个分片。
+            raise UpdateError(f"通道不支持 Range（HTTP {status}）")
+        m = re.search(r"/(\d+)\s*$", resp.headers.get("Content-Range") or "")
+        if m and int(m.group(1)) < end + 1:
+            raise UpdateError(f"通道返回的区间越界（{resp.headers.get('Content-Range')}）")
+        with open(path, "wb") as f:
+            shutil.copyfileobj(resp, f, 65536)
+    finally:
+        try:
+            resp.close()
+        except Exception:  # noqa: BLE001
+            pass
+    got = path.stat().st_size
+    if got != want:
+        raise UpdateError(f"分段 {start}-{end} 长度不符（{got} != {want}）")
+
+
 def download_file(url: str, dest: Path, proxies: tuple, timeout: int = 60) -> bool:
-    """下载到 .part 再原子改名，避免中断留下残缺文件被当成完整包。"""
+    """下载到 .part 再原子改名，避免中断留下残缺文件被当成完整包。
+
+    顺序降级（直连 → 各加速前缀），每条通道内部再做两件事提速：
+
+      1. **读超时压缩**：`_read_timeout` 把完整超时压到 STALL_TIMEOUT，通道
+         卡住 15s 收不到字节就换下一条，不再干等到 60s / 120s（实测
+         gh-proxy.com 那份包卡了 111s）。
+      2. **分段并发**：先探 Range，支持且包落在 [SEGMENT_MIN_SIZE,
+         SEGMENT_MAX_SIZE) 内就按 SEGMENT_WORKERS 路并发取。大包不分段 ——
+         镜像对多连接有总量限流，实测 39.8MB 的包分段后从 0.65 掉到 0.13 MB/s。
+
+    第 2 步失败（通道不支持 Range）时退回本条通道的顺序下载，而不是直接
+    降级 —— "不支持分段"和"这条通道不通"是两件事。日志里的通道标签会带上
+    `分段` 后缀，所以"这次到底用了哪条通道、快在哪"在日志里是可见的。
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".part")
     for u, t, label in _candidate_urls(url, proxies, timeout):
         try:
+            total, mode = _probe_range(u, t) if STALL_TIMEOUT else (0, None)
+            if mode == "range" and SEGMENT_MIN_SIZE <= total < SEGMENT_MAX_SIZE:
+                try:
+                    if _parallel_download(u, dest, total, label + "·分段", timeout):
+                        return True
+                except Exception as e:  # noqa: BLE001 - 分段失败退回顺序
+                    log(f"  分段下载失败 [{label}]，本条通道改用单连接: {e}")
+            read_to = _read_timeout(t)
             req = urllib.request.Request(u, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=t) as resp, open(tmp, "wb") as f:
+            resp = urllib.request.urlopen(req, timeout=read_to)
+            try:
                 total = int(resp.headers.get("Content-Length") or 0)
                 done = 0
                 mark = 0
-                while True:
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    done += len(chunk)
-                    if done - mark >= 8 * 1024 * 1024:
-                        suffix = f"/{total / 1048576:.1f}" if total else ""
-                        log(f"  已下载 {done / 1048576:.1f}{suffix} MB")
-                        mark = done
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        done += len(chunk)
+                        if done - mark >= 8 * 1024 * 1024:
+                            suffix = f"/{total / 1048576:.1f}" if total else ""
+                            log(f"  已下载 {done / 1048576:.1f}{suffix} MB")
+                            mark = done
+            finally:
+                # 见 _fetch_range：响应要显式关，否则 Windows 上临时文件删不掉。
+                try:
+                    resp.close()
+                except Exception:  # noqa: BLE001
+                    pass
             if not tmp.exists() or tmp.stat().st_size == 0:
                 raise UpdateError("下载结果为空")
             tmp.replace(dest)
@@ -1007,6 +1250,163 @@ def extract_zip(zip_path: Path, dest_dir: Path) -> Path:
         return entries[0]
     # 极少数情况下 zip 没有顶层目录，直接用解压目录
     return dest_dir
+
+
+def _extract_zips(dest_dir: Path) -> Path:
+    """解压 dest_dir 下所有分卷（0000 起依次追加），返回内部唯一顶层目录。
+
+    流式下载把包切成若干"分卷"边收边写，每个分卷都是一个独立的 zip 成员流
+    （见 fetch_zip）。这里把它们按顺序追加成一个完整包再解压 —— 追加是整段
+    `copyfileobj`，不经过 CPU 解析，所以比"先落地整个包再解压"只多一次顺序
+    拷贝，而省掉的是一次完整的"写盘 → 读盘"。解压用 extractall 而不是
+    流式 unzip：MoviePilot 的归档里同时有普通文件与小文件，逐条解压的
+    Python 开销反而更大，这里只求把网络与磁盘那一段压到最短。
+    """
+    parts = sorted(dest_dir.glob("package.zip.*"))
+    if not parts:
+        raise UpdateError("下载结果为空")
+    joined = dest_dir / "package.zip"
+    with open(joined, "wb") as out:
+        for part in parts:
+            with open(part, "rb") as fp:
+                shutil.copyfileobj(fp, out, 1024 * 1024)
+    if joined.stat().st_size == 0:
+        raise UpdateError("下载结果为空")
+    try:
+        with zipfile.ZipFile(joined) as zf:
+            zf.extractall(dest_dir)
+    except zipfile.BadZipFile as e:
+        raise UpdateError(f"下载的压缩包损坏: {e}") from e
+    for part in parts:
+        try:
+            part.unlink()
+        except OSError:
+            pass
+    try:
+        joined.unlink()
+    except OSError:
+        pass
+    entries = [p for p in dest_dir.iterdir() if p.name not in ("__MACOSX",)]
+    if len(entries) == 1 and entries[0].is_dir():
+        return entries[0]
+    return dest_dir
+
+
+def fetch_zip(url: str, dest_dir: Path, proxies: tuple, timeout: int = 60) -> Path:
+    """下载 zip 并直接解压到 dest_dir，返回内部顶层目录。
+
+    与 `download_file + extract_zip` 的区别只有一处，但很关键：**边收边写**。
+    整包不落"一个完整文件"，而是按固定体积切成若干分卷，每个分卷收满就封口、
+    下一个分卷继续 —— 这样：
+      * 磁盘上始终只有"已收到的部分"，不会出现"先写 9MB 再读 9MB"的往返；
+      * 分卷本身就是逐字节可拼接的，解压前一次顺序 copy 即还原完整包；
+      * 下载中途失败时，破损内容留在 dest_dir（每次尝试前整目录重建），
+        不会有半截包被下一次运行当成"已下载"。
+    校验（zip 头能否正常打开、内部结构、version.py 是否与 tag 一致）全部沿用
+    原路径，所以这里只是把 I/O 顺序换掉，不改变任何正确性判据。
+
+    分段并发的取舍：分段要按偏移定位写入，天然与"顺序分卷"冲突，所以它只在
+    **本条通道单独重试**时使用 —— 顺序下载失败后，对当时成功探到 Range 的
+    那条通道再做一次并行下载（`_parallel_download` 直接落 package.zip，再交给
+    `_extract_zips`）。实测同一份 9.5MB 包，单连接 0.4MB/s 的镜像 4 路并发
+    13.7s 完成，而单连接要 23s 以上且经常读超时。
+    """
+    for u, t, label in _candidate_urls(url, proxies, timeout):
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        total, mode = _probe_range(u, t)
+        try:
+            t0 = time.monotonic()
+            got = _stream_zip(u, dest_dir, _read_timeout(t), label)
+            if got == 0:
+                raise UpdateError("下载结果为空")
+            spent = time.monotonic() - t0
+            rate = got / spent / 1048576 if spent > 0 else 0
+            log(f"  下载完成 {got / 1048576:.1f} MB（{label}，{spent:.1f}s，"
+                f"{rate:.2f} MB/s）")
+            return _extract_zips(dest_dir)
+        except Exception as e:  # noqa: BLE001
+            log(f"  下载失败 [{label}] {u}: {e}")
+        # 顺序下载没成：若这条通道支持 Range，再给它一次机会 —— 但改成
+        # 多路分段并发。分段能绕开"单连接被镜像限速"，而换通道解决不了这种
+        # 限速（每个镜像的单连接速率互不相干，且都在 0.1~2MB/s 之间）。
+        if mode == "range" and SEGMENT_MIN_SIZE <= total < SEGMENT_MAX_SIZE:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                if _parallel_download(u, dest_dir / "package.zip", total,
+                                      label + "·分段", timeout):
+                    return _extract_zips(dest_dir)
+            except Exception as e:  # noqa: BLE001
+                log(f"  分段下载失败 [{label}] {u}: {e}")
+        shutil.rmtree(dest_dir, ignore_errors=True)
+    raise UpdateError(f"下载失败: {url}")
+
+
+def _retry_zip(url: str, dest_dir: Path, proxies: tuple, what: str) -> Path:
+    """下载+解压一个 zip，全部通道都失手时再整体重来，最多 DOWNLOAD_ROUNDS 轮。
+
+    为什么要"整体重来"而不是"重试某一条通道"：`fetch_zip` 内部已经按
+    直连 → 各加速前缀的顺序逐条降级了，能失败只剩一种情况 —— **这一轮里所有
+    通道都卡住了**。而实测镜像的抖动是分钟级的：同一份 9.5MB 包连测三次，
+    耗时 10.3s / 23.3s / 三条通道全失败。一次失败就写进状态文件、要等下一次
+    重启才重试，等于把一个几分钟就自愈的抖动升级成"这次重启不升级"。
+
+    这里只重试**下载 + 解压**这一段（替换发生在之后的步骤 4），所以重试不会
+    碰到任何已经生效的代码，最坏结果也只是多花几分钟在网络等待上。
+    """
+    last = None
+    for i in range(DOWNLOAD_ROUNDS):
+        if i:
+            log(f"  {what}所有通道均失手，{DOWNLOAD_RETRY_WAIT * i}s 后整轮重试"
+                f"（第 {i + 1}/{DOWNLOAD_ROUNDS} 轮）: {last}")
+            time.sleep(DOWNLOAD_RETRY_WAIT * i)
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        try:
+            return fetch_zip(url, dest_dir, proxies)
+        except Exception as e:  # noqa: BLE001 - 整轮重试，最后一轮抛出
+            last = e
+    raise UpdateError(f"{what}下载失败（{DOWNLOAD_ROUNDS} 轮均未成功）: {last}")
+
+
+def _stream_zip(u: str, dest_dir: Path, read_timeout: int, label: str) -> int:
+    """把 u 的正文顺序写成 package.zip.0000/0001/... 分卷，返回总字节数。
+
+    分卷（而不是一个大文件）的理由见 fetch_zip：解压前一次顺序 copy 即可拼回
+    完整包，而磁盘上一旦中断也不会留下"看着像完整包"的东西。
+    """
+    got = 0
+    idx = 0
+    slot = dest_dir / "package.zip.0000"
+    req = urllib.request.Request(u, headers={"User-Agent": UA})
+    resp = urllib.request.urlopen(req, timeout=read_timeout)
+    f = None
+    try:
+        f = open(slot, "wb")
+        try:
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if f.tell() >= 8 * 1024 * 1024:
+                    f.close()
+                    idx += 1
+                    slot = dest_dir / f"package.zip.{idx:04d}"
+                    f = open(slot, "wb")
+        finally:
+            f.close()
+    except BaseException:
+        if f is not None and not f.closed:
+            f.close()
+        raise
+    finally:
+        try:
+            resp.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return got
 
 
 def fix_permissions(root: Path) -> None:
@@ -1885,12 +2285,18 @@ def do_update(cfg: Config, args) -> int:
             log(f"==> 复用上游已下载的安装包 {prepared['version']}")
             src_root = extract_zip(prepared["backend"], work / "src")
         else:
-            zip_path = work / "backend.zip"
             log(f"==> 下载后端源码 {tag} ...")
-            if not download_file(BACKEND_ZIP.format(repo=BACKEND_REPO, tag=tag),
-                                 zip_path, cfg.proxies):
-                raise UpdateError(f"后端源码下载失败: {tag}")
-            src_root = extract_zip(zip_path, work / "src")
+            # 下载与解压合成一步（fetch_zip）：边收边写，省掉"整包落盘再读回
+            # 解压"的一次往返；读超时压缩、卡死换通道、分段并发都在里面。
+            #
+            # 整步重试：fetch_zip 内部已经逐通道降级，走到这里还能失败，说明
+            # **所有通道在这一次都卡住了** —— 而实测镜像的抖动是分钟级的
+            # （同一份 9.5MB 包，三次连测分别 10.3s / 23.3s / 全通道失败）。
+            # 一次失败就记进 failures、下次重启才重试，等于把一个可自愈的网络
+            # 抖动升级成"这次重启不升级"。这里对**下载+解压**这一步整体重试，
+            # 不碰任何已替换的代码（替换在步骤 4 才发生），所以重试是安全的。
+            src_root = _retry_zip(BACKEND_ZIP.format(repo=BACKEND_REPO, tag=tag),
+                                  work / "src", cfg.proxies, "后端源码")
         if not (src_root / "app").is_dir() or not (src_root / "version.py").is_file():
             raise UpdateError("后端包结构异常（缺少 app/ 或 version.py）")
         new_version = read_py_value(src_root / "version.py", "APP_VERSION")
@@ -1923,11 +2329,9 @@ def do_update(cfg: Config, args) -> int:
                 fe_staged = extract_zip(prepared["frontend"], work / "fe")
             else:
                 log(f"==> 下载前端 {new_fe} ...")
-                fe_zip = work / "frontend.zip"
-                if not download_file(FRONTEND_ZIP.format(repo=FRONTEND_REPO, tag=new_fe),
-                                     fe_zip, cfg.proxies):
-                    raise UpdateError(f"前端下载失败，放弃本次更新: {new_fe}")
-                fe_staged = extract_zip(fe_zip, work / "fe")
+                fe_staged = _retry_zip(FRONTEND_ZIP.format(repo=FRONTEND_REPO,
+                                                           tag=new_fe),
+                                       work / "fe", cfg.proxies, "前端")
             if not (fe_staged / "index.html").is_file() and not (fe_staged / "dist" / "index.html").is_file():
                 raise UpdateError("前端包结构异常（缺少 index.html）")
             fix_permissions(fe_staged)

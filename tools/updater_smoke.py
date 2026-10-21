@@ -326,8 +326,13 @@ def scenario_g():
 
     # 1) 直接解析 argparse 定义，而不真的执行各开关：
     #    --force / --rollback 会真的联网下载或回滚，跑起来既慢又不确定。
+    # encoding 必须写死 utf-8：mp_updater.py 的帮文是中文，而 Windows 上
+    # subprocess 默认按**本地代码页**（GBK）解码子进程输出 —— 遇到 utf-8 字节
+    # 直接 UnicodeDecodeError，r.stdout 变成 None，五个开关全判"没列出"。
+    # 这条用例在 Linux/CI 上永远是绿的，只在 Windows 开发机上假红。
     r = subprocess.run([sys.executable, str(script), "--help"],
-                       capture_output=True, text=True, timeout=60)
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=60)
     help_text = (r.stdout or "") + (r.stderr or "")
     for name in expected:
         check(f"G1 --help 列出 {name}", name in help_text,
@@ -458,13 +463,13 @@ def scenario_h():
     # 已失效的镜像（ghfast.top 对 jxxghp/* 全量 403；gh-proxy.com / gh-proxy.org 本机
     # 连不上或速度≈0）必须不在列表里，留着只会白等一个失败周期。用真实常量而非硬编码
     # 字符串，避免改常量时测试跟着一起改。
-    check("H18 内置镜像顺序与内容正确",
+    check("H20 内置镜像顺序与内容正确",
           mod.DEFAULT_PROXIES == ("https://gh.dpik.top/", "https://v4.gh-proxy.org/")
           and all(p.endswith("/") for p in mod.DEFAULT_PROXIES),
           str(mod.DEFAULT_PROXIES))
 
     # 只有带 v4. 前缀的子域可用，裸 gh-proxy.org 基本不通 —— 写错就整条通道失效。
-    check("H19 代理前缀带 v4. 子域",
+    check("H21 代理前缀带 v4. 子域",
           all("gh-proxy.org" not in p or p == "https://v4.gh-proxy.org/"
               for p in mod.DEFAULT_PROXIES),
           str(mod.DEFAULT_PROXIES))
@@ -510,87 +515,44 @@ def scenario_h():
 
     # 端到端：真正调用 download_file，记录每次尝试用的 timeout —— 只看
     # _candidate_urls 的返回值测不出"调用方忘了把 t 传下去"这种错。
+    #
+    # 现在每条通道会先发一次 Range 探测、再发正文（见 _probe_range / _read_timeout），
+    # 所以断言按"通道"分组，而不是按"裸调用次数"—— 否则探测请求会被误当成一次
+    # 下载尝试。
     real_urlopen = mod.urllib.request.urlopen
     tries = []
 
     def fake_urlopen(req, timeout=None, **kw):
-        tries.append((getattr(req, "full_url", str(req)), timeout))
+        tries.append((getattr(req, "full_url", str(req)), timeout,
+                      req.headers.get("Range")))
         raise OSError("smoke: 无网络")
 
     mod.urllib.request.urlopen = fake_urlopen
     try:
         ok = mod.download_file(GH, SANDBOX / "_probe" / "dist.zip", MIRRORS, timeout=60)
         check("H26 下载全程失败返回 False", ok is False, str(ok))
-        check("H27 下载三次尝试的超时 = 直连上限/完整/完整",
-              [t for _u, t in tries] == [mod.DIRECT_ATTEMPT_TIMEOUT, 60, 60], str(tries))
-        check("H28 下载尝试顺序 = 直连 → 镜像（顺序即降级顺序）",
-              [u for u, _t in tries] == [GH, "https://gh.dpik.top/" + GH,
-                                         "https://v4.gh-proxy.org/" + GH],
-              str([u for u, _t in tries]))
+        bodies = [(u, t) for u, t, rng in tries if not rng]
+        check("H27 正文尝试顺序 = 直连 → 镜像（顺序即降级顺序）",
+              [u for u, _t in bodies] == [GH, "https://gh.dpik.top/" + GH,
+                                          "https://v4.gh-proxy.org/" + GH],
+              str(bodies))
+        # 每次正文尝试的超时 = min(该通道完整超时, STALL_TIMEOUT)：受限网络里
+        # 通道卡住时 15s 收不到字节就该换下一条，不能干等 60s。
+        # 正文读超时 = min(该通道的完整超时, STALL_TIMEOUT)：直连那次的上限本来就是
+        # DIRECT_ATTEMPT_TIMEOUT(8s)，加速候选才是 60s。两者都要压到 STALL_TIMEOUT
+        # 以内，否则"通道卡住时换下一条"这件事仍然要等满完整超时。
+        check("H27b 正文读超时不超过 STALL_TIMEOUT",
+              all(t == min(cap, mod.STALL_TIMEOUT)
+                  for (_u, t), cap in zip(bodies, [mod.DIRECT_ATTEMPT_TIMEOUT, 60, 60]))
+              and mod.STALL_TIMEOUT < 60,
+              f"{bodies} stall={mod.STALL_TIMEOUT}")
+        check("H27c 每条通道都先探 Range（探测超时更短）",
+              [u for u, _t, rng in tries if rng] == [GH, "https://gh.dpik.top/" + GH,
+                                                    "https://v4.gh-proxy.org/" + GH]
+              and all(t <= mod.PROBE_TIMEOUT for _u, t, rng in tries if rng),
+              str(tries))
     finally:
         mod.urllib.request.urlopen = real_urlopen
-
-    # 成功行必须带上实际通道。用假响应让"直连"和"镜像"分别成功一次，直接读日志。
-    class _FakeResp:
-        def __init__(self, body):
-            self._body = body
-            self.headers = {"Content-Length": str(len(body))}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def read(self, n=-1):
-            if not self._body:
-                return b""
-            if n is None or n < 0:
-                out, self._body = self._body, b""
-                return out
-            out, self._body = self._body[:n], self._body[n:]
-            return out
-
-    real_log = mod.log
-    captured = []
-
-    def capture(msg):
-        captured.append(str(msg))
-        real_log(msg)
-
-    mod.log = capture
-    try:
-        mod.urllib.request.urlopen = lambda req, timeout=None, **k: _FakeResp(b"d" * 2048)
-        direct_ok = mod.download_file(GH, SANDBOX / "_probe" / "d.zip", MIRRORS, timeout=60)
-        direct_lines = [m for m in captured if "下载完成" in m]
-
-        captured.clear()
-        calls = {"n": 0}
-
-        def mirror_ok(req, timeout=None, **k):
-            calls["n"] += 1
-            if calls["n"] == 1:               # 直连失败，镜像成功
-                raise OSError("smoke: 直连超时")
-            return _FakeResp(b"m" * 2048)
-
-        mod.urllib.request.urlopen = mirror_ok
-        mirror_ok_done = mod.download_file(GH, SANDBOX / "_probe" / "m.zip", MIRRORS,
-                                           timeout=60)
-        mirror_lines = [m for m in captured if "下载完成" in m]
-        fail_lines = [m for m in captured if "下载失败" in m]
-    finally:
-        mod.urllib.request.urlopen = real_urlopen
-        mod.log = real_log
-        shutil.rmtree(SANDBOX / "_probe", ignore_errors=True)
-
-    check("H29 直连成功时成功行写明“直连”",
-          direct_ok and direct_lines and "直连" in direct_lines[-1], str(direct_lines))
-    check("H30 镜像成功时成功行写明具体镜像",
-          mirror_ok_done and mirror_lines and "加速(gh.dpik.top)" in mirror_lines[-1],
-          str(mirror_lines))
-    check("H31 失败行也标注通道（并保留完整 URL）",
-          bool(fail_lines) and "直连" in fail_lines[0] and GH in fail_lines[0],
-          str(fail_lines))
 
     # API 必须只直连：带上加速前缀时，不转发 api 的镜像会挂到 SSL 握手超时而不是
     # 快速报错，白白拖长启动路径的更新检查（实测 ghfast.top / gh-proxy.org）。
@@ -1154,6 +1116,196 @@ def scenario_k():
         shutil.rmtree(probe_root, ignore_errors=True)
 
 
+def scenario_dl():
+    """DL 下载提速契约（离线）。单独成场景是为了**可单独运行**：
+
+    场景 H 末尾有真实网络用例，受限网络或镜像抖动时整套会卡到超时，而这里的
+    每一条都是可以完全离线判定的 —— 提速相关的回归不该被网络状况掩盖。
+    """
+    print("\n=== 场景 DL：下载提速（读超时 / 分段 / 整轮重试）===")
+    real_urlopen = mod.urllib.request.urlopen
+    real_bin_name = "__dl_body"
+
+    class _Resp:
+        def __init__(self, body, status=206, total=None, headers=None):
+            self._body = body
+            self.status = status
+            self.headers = dict(headers or {})
+            if total is not None:
+                self.headers["Content-Range"] = f"bytes 0-{len(body) - 1}/{total}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, n=-1):
+            if not self._body:
+                return b""
+            if n is None or n < 0:
+                out, self._body = self._body, b""
+                return out
+            out, self._body = self._body[:n], self._body[n:]
+            return out
+
+    GH = "https://github.com/jxxghp/MoviePilot/archive/refs/tags/v3.1.8.zip"
+    probe_root = SANDBOX / "_dlprobe"
+    try:
+        # DL1 探到 206 + Content-Range → 可分段并拿到总长
+        mod.urllib.request.urlopen = lambda req, timeout=None, **k: _Resp(b"x", 206, 9_938_141)
+        check("DL1 206 + Content-Range 判为可分段",
+              mod._probe_range(GH, 60) == (9_938_141, "range"),
+              str(mod._probe_range(GH, 60)))
+
+        # DL2 200 + chunked（无任何长度）→ 不分段。实测 gh.dpik.top 正是这种回法，
+        # 早先只认"200 + Content-Length"的实现会误判，进而把 chunked 当整包写进
+        # 第 0 个分片。
+        def _chunked(req, timeout=None, **k):
+            return _Resp(b"x", 200, headers={"Transfer-Encoding": "chunked"})
+        mod.urllib.request.urlopen = _chunked
+        check("DL2 chunked 无长度时判为不可分段", mod._probe_range(GH, 60) == (0, None),
+              str(mod._probe_range(GH, 60)))
+
+        # DL3 200 + Content-Length → 知道长度但不可分段
+        def _whole(req, timeout=None, **k):
+            return _Resp(b"x" * 10, 200, headers={"Content-Length": "10"})
+        mod.urllib.request.urlopen = _whole
+        check("DL3 200 + Content-Length 判为可整取不可分段",
+              mod._probe_range(GH, 60) == (10, "whole"), str(mod._probe_range(GH, 60)))
+
+        # DL4 读超时压缩：必须真的短于完整超时，且调用方给得更短时取 min
+        check("DL4 读超时压到 STALL_TIMEOUT 且取 min",
+              mod._read_timeout(120) == mod.STALL_TIMEOUT
+              and mod._read_timeout(3) == 3 and mod.STALL_TIMEOUT < 60,
+              f"{mod._read_timeout(120)}/{mod._read_timeout(3)}/{mod.STALL_TIMEOUT}")
+
+        # DL5 端到端分段拼接：假服务端按 Range 切片，拼出的文件必须逐字节一致
+        body = bytes(range(256)) * 9000          # 2.3MB
+        def _slice(req, timeout=None, **k):
+            a, b = (int(x) for x in req.headers["Range"].split("=")[1].split("-"))
+            return _Resp(body[a:b + 1], 206, len(body))
+        mod.urllib.request.urlopen = _slice
+        probe_root.mkdir(parents=True, exist_ok=True)
+        d = probe_root / "seg.bin"
+        real_size = mod.SEGMENT_SIZE
+        mod.SEGMENT_SIZE = 64 * 1024             # 强制切成多段
+        try:
+            ok = mod._parallel_download(GH, d, len(body), "smoke", timeout=60)
+        finally:
+            mod.SEGMENT_SIZE = real_size
+        check("DL5 分段下载拼接逐字节一致", bool(ok) and d.read_bytes() == body, f"ok={ok}")
+
+        # DL6 单段失败只重试本段：失败 SEGMENT_ATTEMPTS-1 次后成功，整体应成功
+        seen = {"n": 0}
+        def _flaky(req, timeout=None, **k):
+            a, b = (int(x) for x in req.headers["Range"].split("=")[1].split("-"))
+            seen["n"] += 1
+            if seen["n"] < mod.SEGMENT_ATTEMPTS:
+                raise OSError("smoke: 该段断流")
+            return _Resp(body[a:b + 1], 206, len(body))
+        mod.urllib.request.urlopen = _flaky
+        real_backoff, mod.SEGMENT_BACKOFF = mod.SEGMENT_BACKOFF, 0
+        mod.SEGMENT_SIZE = len(body)             # 单段，精确控制"这一次"失败
+        try:
+            ok6 = mod._parallel_download(GH, probe_root / "one.bin", len(body), "smoke",
+                                         timeout=60)
+        finally:
+            mod.SEGMENT_BACKOFF = real_backoff
+            mod.SEGMENT_SIZE = real_size
+        check("DL6 单段失败重试后整体成功且重试次数正确",
+              bool(ok6) and seen["n"] == mod.SEGMENT_ATTEMPTS,
+              f"n={seen['n']}/{mod.SEGMENT_ATTEMPTS}")
+
+        # DL7 单段重试耗尽 → 整体失败（并抛 UpdateError，供上层降级/整轮重试）
+        mod.urllib.request.urlopen = lambda req, timeout=None, **k: (_ for _ in ()).throw(
+            OSError("smoke: 一直断流"))
+        mod.SEGMENT_BACKOFF = real_backoff = 0
+        mod.SEGMENT_SIZE = len(body)
+        raised = False
+        try:
+            mod._parallel_download(GH, probe_root / "dead.bin", len(body), "smoke", timeout=60)
+        except mod.UpdateError:
+            raised = True
+        finally:
+            mod.SEGMENT_SIZE = real_size
+        check("DL7 单段重试耗尽时整体失败", raised)
+
+        # DL8 全通道失手 → 整轮重试 DOWNLOAD_ROUNDS 次（不是一次就记失败）
+        real_fetch, real_wait = mod.fetch_zip, mod.DOWNLOAD_RETRY_WAIT
+        mod.DOWNLOAD_RETRY_WAIT = 0
+        rounds = {"n": 0}
+        def _dead(*a, **k):
+            rounds["n"] += 1
+            raise mod.UpdateError("smoke: 全通道失手")
+        mod.fetch_zip = _dead
+        try:
+            raised = False
+            try:
+                mod._retry_zip("u", probe_root / "r", (), "后端源码")
+            except mod.UpdateError:
+                raised = True
+        finally:
+            mod.fetch_zip = real_fetch
+            mod.DOWNLOAD_RETRY_WAIT = real_wait
+        check("DL8 全通道失手时整轮重试 DOWNLOAD_ROUNDS 次",
+              raised and rounds["n"] == mod.DOWNLOAD_ROUNDS, f"n={rounds['n']}")
+
+        # DL9 分卷解压：拆成 package.zip.00NN 后必须拼回完整包并解出顶层目录
+        import io as _io
+        buf = _io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("MoviePilot-x/version.py", "APP_VERSION = 'v9.9.9'\n")
+            zf.writestr("MoviePilot-x/app/main.py", "print(1)\n")
+        data = buf.getvalue()
+        split = probe_root / "split"
+        split.mkdir(parents=True, exist_ok=True)
+        step = max(1, len(data) // 3)
+        for i in range(0, len(data), step):
+            (split / f"package.zip.{i // step:04d}").write_bytes(data[i:i + step])
+        root = mod._extract_zips(split)
+        check("DL9 分卷拼接后可正确解压且分卷已清理",
+              root.name == "MoviePilot-x" and (root / "version.py").exists()
+              and not list(split.glob("package.zip*")),
+              str(sorted(p.name for p in split.iterdir())))
+
+        # DL10 分段并发数必须 > 1，否则"并发提速"名存实亡
+        check("DL10 分段并发数 > 1", mod.SEGMENT_WORKERS > 1, str(mod.SEGMENT_WORKERS))
+
+        # DL11 大包**不**分段：镜像按连接数做总量限流，实测同一份 39.8MB 前端包
+        # 分段后从 0.65 掉到 0.13 MB/s。这条钉住的是"分段有体积上限"，否则一次
+        # "顺手放宽"就会让最常下载的那个包（前端 dist，40MB）退回慢速。
+        big = mod.SEGMENT_MAX_SIZE + 1
+        called = {"n": 0}
+        def _big_probe(req, timeout=None, **k):
+            return _Resp(b"x", 206, big)
+        real_parallel = mod._parallel_download
+        def _parallel_spy(*a, **k):
+            called["n"] += 1
+            raise mod.UpdateError("smoke: 不该走到分段")
+        mod.urllib.request.urlopen = _big_probe
+        mod._parallel_download = _parallel_spy
+        def _dead_stream(*a, **k):
+            raise OSError("smoke: 顺序下载失败（只为观察是否尝试分段）")
+        real_stream = mod._stream_zip
+        mod._stream_zip = _dead_stream
+        try:
+            try:
+                mod.fetch_zip(GH, probe_root / "big", ("https://m.example/",), timeout=30)
+            except mod.UpdateError:
+                pass
+        finally:
+            mod._stream_zip = real_stream
+            mod._parallel_download = real_parallel
+        check("DL11 超过 SEGMENT_MAX_SIZE 的包不走分段", called["n"] == 0, f"n={called['n']}")
+        check("DL12 分段体积窗口合法（下限 < 上限）",
+              mod.SEGMENT_MIN_SIZE < mod.SEGMENT_MAX_SIZE,
+              f"{mod.SEGMENT_MIN_SIZE}/{mod.SEGMENT_MAX_SIZE}")
+    finally:
+        mod.urllib.request.urlopen = real_urlopen
+        shutil.rmtree(probe_root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     mod._real_smoke_test = mod.smoke_test
     scenario_a()
@@ -1164,6 +1316,7 @@ if __name__ == "__main__":
     scenario_e()
     scenario_f()
     scenario_g()
+    scenario_dl()
     scenario_h()
     scenario_i()
     scenario_j()

@@ -1,559 +1,165 @@
 # MoviePilot 飞牛 fnOS 原生应用
 
-将 [MoviePilot](https://github.com/jxxghp/MoviePilot)（NAS 媒体库自动化管理工具）开发为 **fnOS 原生应用（Native 应用）**，非 Docker 版。
+将 [MoviePilot](https://github.com/jxxghp/MoviePilot)（NAS 媒体库自动化管理工具）封装为 **fnOS 原生应用**，非 Docker 版。
 
 ## 特性
 
 - **原生运行**：不依赖 Docker，直接在 fnOS 上以 Python + Node.js 运行
 - **统一网关接入**：通过 fnOS 统一网关 + 反向代理嵌入桌面 iframe，自动校验 NAS 登录态
-- **SQLite 数据库**：默认使用 SQLite，无需额外安装 PostgreSQL 等中间件
-- **前后端分离**：Python FastAPI 后端 + Vue3 前端（官方预编译产物）
+- **自带 Python 运行时**：随包分发 CPython 3.14 与全部依赖，**安装时零联网、零编译**
+- **SQLite 数据库**：默认 SQLite，无需额外安装 PostgreSQL
+- **重启即升级**：应用每次启动前自动检查上游 Release 并就地更新，无需重新构建 fpk
 - **生命周期管理**：安装向导、启停控制、升级数据备份/恢复、卸载数据保留/删除
 
-## 技术栈与架构
+## 环境要求
 
-| 组件 | 说明 |
+| 项目 | 要求 |
 |------|------|
-| 后端 | MoviePilot V3（FastAPI + Python 3.14），监听 `127.0.0.1:3002` |
-| 前端 | MoviePilot-Frontend（Vue3 预编译 `dist.zip`），Express 静态服务监听 `127.0.0.1:3005`，并代理 `/api`、`/cookiecloud` 到后端 |
-| 网关代理 | `app/bin/gateway-proxy.py`，Unix Socket → 前端端口，完成前缀剥离、JS polyfill、WebSocket 隧道 |
-| Python 运行时 | **自带 CPython 3.14.8**（python-build-standalone，随包分发，安装时不联网）。`manifest` 已不再声明 fnOS 的 `python312` —— 版本不够且用不上，无需安装 |
-| Node 运行时 | fnOS `nodejs_v24`（`manifest` 的 `install_dep_apps` 声明依赖，前端静态服务需要） |
-| 数据库 | SQLite（默认），配置存于 `TRIM_PKGVAR/config` |
-
-```
-用户浏览器 (fnOS 桌面 iframe)
-    │  /app/moviepilot/...
-    ▼
-fnOS 统一网关（校验登录态）
-    ▼  转发到 moviepilot.sock
-gateway-proxy.py  (app/bin/gateway-proxy.py)
-    ▼  剥离前缀 + JS polyfill + WS 隧道
-Node 前端  frontend-server.js  (127.0.0.1:3005)
-    │  静态资源 + SPA 回退
-    └──  /api, /cookiecloud 反向代理
-        ▼
-Python 后端  app/main.py  (127.0.0.1:3002)
-```
-
-### 为什么要改写 Authorization 头
-
-fnOS 统一网关会把请求里的 `Authorization` 当成**它自己的**令牌来校验。MoviePilot 用同一个头传 JWT，
-网关校验不过就直接返回 `200 text/plain "invalid token"`（13 字节），请求根本到不了应用。后果是
-登录之后**所有带认证的接口都失败**：仪表盘 CPU/内存/系统信息全空、关于页的认证资源版本与站点资源
-版本为空、推荐与订阅报「服务器返回了无效响应」、站点认证选站点显示 No data available。
-
-因此 `gateway-proxy.py` 注入的 polyfill 会把该头改名为 `X-MP-Auth`（自定义头网关不校验），代理在
-转发到前端服务时再还原成 `Authorization` 交给后端。回归断言见 `tools/polyfill_smoke.py` 的 H 组与
-端到端用例。
-
-#### 怎么判断是不是撞上了它
-
-在 NAS 上用**同一个接口**做三组对照（`/app/moviepilot/api/v1/dashboard/memory`）：
-
-| 请求 | 经网关的结果 | 结论 |
-|------|--------------|------|
-| 不带认证头 | `401 application/json` | 正常穿过网关 |
-| 自定义头 `X-MP-Auth: <JWT>` | `401 application/json` | 正常穿过网关 |
-| `Authorization: <JWT>` | `200 text/plain "invalid token"`（13 字节） | 被网关拦下，请求根本没到应用 |
-
-```bash
-curl -i -H "Authorization: Bearer $TOKEN" 'http://<NAS>/app/moviepilot/api/v1/dashboard/memory'
-curl -i -H "X-MP-Auth: Bearer $TOKEN"      'http://<NAS>/app/moviepilot/api/v1/dashboard/memory'
-```
-
-排查要点：
-
-- 「登录能成功、登录后所有页面都读不到数据」「前端统一报『服务器返回了无效响应』」时，先看响应体
-  是不是 `text/plain` 的 `invalid token` —— **状态码 200 不代表请求到了应用**，前端因为拿到非 JSON
-  才报那句通用错误
-- 这也能解释为什么 v1.0.3 / v1.0.4 里围绕密钥与站点资源的判断都不是根因：那些请求压根没到后端，
-  自然永远是空数据（密钥仍需持久化，但它不是「No data available」的原因）
-
-### 为什么要自带 Python 3.14
-
-MoviePilot V3 的 `pyproject.toml` 声明 `requires-python >= 3.14`，而 fnOS 应用中心提供的运行时是 `python312` —— 版本不够。官方 Docker 镜像的处理方式同样是自带解释器（`/opt/python`）。本应用沿用同一思路：
-
-- 构建时下载 [python-build-standalone](https://github.com/astral-sh/python-build-standalone) 的 `cpython-3.14.8`（`install_only_stripped`，arm64 约 30 MB / amd64 约 35 MB）
-- 用 `uv` 按 MoviePilot 的 `uv.lock` 把依赖直接装进该解释器的 `site-packages`
-- 整个 `app/python/` 随包分发，**安装时零联网、零编译**
-
-不采用 venv 的原因：venv 的 `bin/python` 是指向构建机绝对路径的符号链接，`pyvenv.cfg` 里也写着构建机路径，打进包搬到 NAS 必然失效。python-build-standalone 的发行版是可重定位的（`sys.prefix` 由二进制位置推导），整个目录搬到哪儿都能跑。
-
-## 目录结构
-
-```
-├── app/
-│   ├── bin/
-│   │   ├── gateway-proxy.py     # 网关反向代理（核心）
-│   │   ├── supervisor.py        # 唯一主进程，托管后端/前端/代理
-│   │   ├── mp_updater.py        # 上游自更新器（重启即升级：主程序 + 站点资源，纯标准库）
-│   │   └── frontend-server.js   # Node 前端服务 + API 代理
-│   ├── mp/                      # MoviePilot V3 源码（build 时下载）
-│   │   └── requirements.lock.txt# 由 uv.lock 导出的锁定依赖清单（在线兜底时用）
-│   ├── frontend/                # 前端 dist（build 时下载）
-│   ├── python/                  # 自带 CPython 3.14 + 全部依赖（--with-runtime 时内置）
-│   └── ui/
-│       ├── config               # 桌面入口（统一网关）
-│       └── images/              # 入口图标
-├── cmd/                         # 生命周期脚本
-│   ├── lib.sh                   # 公共函数（运行用户/权限收敛/密码校验/运行时解析）
-│   ├── main                     # start / stop / status / update / update-check / resources / rollback
-│   ├── install_init/callback
-│   ├── config_init/callback
-│   ├── upgrade_init/callback
-│   └── uninstall_init/callback
-├── config/
-│   ├── privilege                # run-as=package
-│   └── resource                 # data-share
-├── wizard/                      # 安装/配置/卸载向导
-├── manifest
-├── build.py                    # 跨平台构建脚本（推荐）
-├── tools/
-│   ├── bump_upstream.py        # 上游版本检查/升级：改 build.py 的 pin + 同步 manifest（CI 每周跑，本地也可跑）
-│   ├── bump_upstream_smoke.py  # 上游版本检查/升级的离线冒烟测试（沙箱，不联网；钉住「changelog 只保留最新版本」与上游摘要清洗/回退）
-│   ├── updater_smoke.py        # 自更新器离线冒烟测试（主程序 + 站点资源同步，沙箱，Windows 亦可跑）
-│   ├── resources_smoke.py      # 站点资源修复/回填的离线冒烟测试
-│   ├── supervisor_smoke.py     # 进程托管（失败计数/退避/重启）的离线冒烟测试
-│   ├── cmd_env_smoke.py        # 生命周期脚本 app.env 生成逻辑的离线冒烟测试（需 bash）
-│   ├── pkgsize_smoke.py        # 打包优化（符号链接保留、链接审计、写入代价统计）的冒烟测试
-│   └── polyfill_smoke.py       # 代理注入的 JS polyfill 冒烟测试（需 node，缺失则 SKIP）
-├── .github/workflows/
-│   ├── check-upstream.yml      # 每周二检查上游 → 改 pin/manifest → 打 tag → 派发构建
-│   └── build-and-release.yml   # 分架构打包并创建 Release
-├── ICON.PNG / ICON_256.PNG
-└── README.md
-```
-
-## 构建
-
-**推荐使用跨平台 `build.py`**（Windows / Linux / macOS 通用）：
-
-```bash
-# 下载源码+前端并打包
-python build.py
-
-# 常用参数
-python build.py --force             # 强制重新下载外部资源
-python build.py --clean             # 构建前清理 .local-build
-python build.py --skip-mp           # 跳过下载后端源码
-python build.py --skip-fe           # 跳过下载前端
-python build.py --arch arm64        # 显式声明目标架构（裁剪 sites 原生变体）
-python build.py --with-runtime      # 自带 Python 3.14 运行时 + 全部依赖（安装时完全不联网，仅 Linux/macOS）
-python build.py --with-runtime --no-build
-                                    # 严格模式：禁止源码构建，只用预编译 wheel
-```
-
-> `--with-venv` 仍可用，是 `--with-runtime` 的兼容别名（早期版本打包的是 venv，现已改为自带解释器）。
-
-构建脚本会自动：
-1. 从 GitHub 下载 MoviePilot V3 源码到 `.local-build/mp`（打包内置）。**下载的是 `build.py` 里 `UPSTREAM_TAG` 钉住的那个上游 tag**（当前 `v3.0.10-1`），而不是每次去查 `releases/latest` —— 同一个 tag 的包必须可复现，否则上游一发新版，重跑同一次构建就会悄悄换成新代码，而包名还写着旧版本。升级上游就是改这一个常量（`tools/bump_upstream.py` 自动改，并同步 `manifest`）；只有该 tag 在上游被**确定性删除**（API 404）时才回退到 `releases/latest`
-2. 从 GitHub Releases 下载前端 `dist.zip` 到 `.local-build/frontend`（打包内置）
-3. 同步 MoviePilot-Resources 资源包到后端源码的站点资源目录（V3 必需；目录名随上游重构变过，`app/helper` → `app/application/site`，构建时按源码结构自动定位，缺失会报 `No module named 'app.application.site.sites'`）
-4. （可选 `--with-runtime`）下载 CPython 3.14.8 到 `.local-build/python`，用 `uv` 按 `uv.lock` 装依赖，并做三道自检（依赖自检 / wheel glibc 审计 / 关键路径断言）
-5. 在 `.local-build/pkg/` 组装干净的应用目录树（仓库源码 + 构建产物），下载 fnpack 到 `.local-build/tools` 并打包生成 `moviepilot-<version>.fpk`
-
-**所有下载/解压/构建产物统一收敛到 `.local-build/`（已 gitignore，不入库）**，项目根目录不残留任何构建产物。
-
-> 下载策略：**先直连 GitHub，直连不通再按内置加速前缀列表依次降级**（`gh.dpik.top` → `v4.gh-proxy.org`，见 `build.py` 的 `PROXIES`），避免 GitHub 被限时卡死。
-> ⚠️ 本机实测直连 `github.com` 已完全不可用（归档 zip / Release / raw 全部超时），加速前缀是当前唯一可用的下载通道。
-> 运行时自更新（`mp_updater.py`）同理：有加速前缀可退时，**直连那次只给 8 秒**
-> （`DIRECT_ATTEMPT_TIMEOUT`）判死就交给镜像，不再挂满完整超时白等（下载 60s、
-> 版本发现每通道 10s）。`api.github.com` 没有可退通道，仍是完整超时、不缩短。
-> 日志里成功行与失败行都会注明本次走的是 `直连` 还是 `加速(gh.dpik.top)` 之类的通道。
-
-### GitHub Actions 自动构建（分架构 + 自带 Python 运行时）
-
-仓库内置两个 workflow：
-
-| workflow | 作用 | 触发 |
-|----------|------|------|
-| `.github/workflows/check-upstream.yml` | 检查上游有没有新版本，有就改 pin + 改 manifest → 提交 → 打 tag → 派发构建 | **每周二** 03:23 UTC（北京时间 11:23），或手动 `workflow_dispatch` |
-| `.github/workflows/build-and-release.yml` | 分架构打包并创建 Release | 上面派发、push `v*` tag，或手动 `workflow_dispatch`（只构建不发 Release） |
-
-`build-and-release.yml`：
-
-- **触发方式**：
-  - 打标签发布：`git tag v3.0.10-1 && git push origin v3.0.10-1`（自动生成 Release 并附带 changelog）
-  - 手动触发：Actions 页点 `workflow_dispatch`（只构建，不发 Release）
-- 推分支**不会**触发这个 workflow —— 单架构十几分钟、产物 250 MB，每次提交都跑不划算。
-
-> 打 tag 前先确认 `manifest` 的 `version` 已同步改动：CI 会校验 tag 与 manifest 版本一致，
-> 不一致直接失败（避免发出"标题 v1.0.2、附件却是 moviepilot-1.0.1.fpk"的 Release）。
-- **分架构矩阵**：`amd64`（ubuntu-latest）、`arm64`（ubuntu-24.04-arm）
-- **自带运行时**：每个架构的 runner 上执行 `python build.py --with-runtime --arch <arch>`，把该架构的 CPython 3.14 与依赖打进包，安装时**完全无需联网**
-- **产物校验**：打包后会嵌套解开 `app.tgz`，断言 `app/python/bin/python3`、`lib/python3.14/site-packages` 存在，并抽查 `fastapi/uvicorn/sqlalchemy/pydantic_core/orjson` —— 防止再次出现「CI 全绿但包里没有依赖」的静默失败
-- **产物命名**：`moviepilot-<version>-<arch>.fpk`（如 `moviepilot-3.0.10-1-amd64.fpk`）
-
-> 说明：打包前会在 `.local-build/pkg/` 组装干净的应用目录树（只含该进包的内容），再调用 fnpack 打包，因此包内不会混入任何构建缓存/临时文件。
-
-### 每周自动跟进上游（`check-upstream.yml`）
-
-每周二定时检查上游 `jxxghp/MoviePilot` 的最新 tag：**有更新就改 `build.py` 的 `UPSTREAM_TAG`
-pin 与 `manifest`（`version` + `changelog`）→ 提交 master → 打同名 tag → 派发构建**；
-**没更新则整条流水线只做一次几秒钟的空转，不改任何文件、不发 Release**。
-
-- **版本号就是上游 tag**（去掉前导 `v`）：上游 `v3.0.10-1` → 应用版本 `3.0.10-1`。
-  上游对同一版本重新打包时会发 `-N` 后缀（`v2.9.16-2`、`v3.0.10-1`），这是正式版而非预发布，
-  所以 `-N` 也照常算作新版本。
-- **为什么要单独一个 workflow**：GitHub 有一条硬规则 —— 用内置 `GITHUB_TOKEN` 推送的 tag
-  **不会触发其它 workflow**（防递归）。所以「push tag → 由 tag 触发构建」这条路走不通：
-  tag 会推上去，但构建永远不会开始，而且 pin 已提交，下次检查会判定「无更新」，
-  这个版本就永远不会有 Release。只有 `workflow_dispatch` / `repository_dispatch` 被排除在该规则之外，
-  因此改成显式**派发** `build-and-release.yml`（所以本 workflow 需要 `actions: write`）。
-- **幂等 / 自愈**：提交成功后下次检查读到的 pin 已是最新，直接跳过；万一「提交成功但派发失败」，
-  下次运行会发现「tag 在、Release 不在」并自动补派发一次。
-- **`changelog` 只保留最新版本，不做累积**：本仓库的既定口径是 manifest 里始终只有
-  **当前版本这一条**条目（`tools/bump_upstream.py` 的 `MAX_CHANGELOG_ENTRIES = 1`）。
-  changelog 会进包内 manifest 并显示在应用中心，同时又是 Release notes 的来源，越滚越长没有意义；
-  所以每次跟进上游都是**整条替换**，而不是把新条目追加到历史条目后面。
-- **Release 正文只显示「版本号 + 第 1 条」**：`build-and-release.yml` 在发布时把 changelog
-  按 `<br>` 切段，只取前两段（`vX.Y.Z` 与本次更新内容），第 2、3 条（上游零改动口径、
-  自带 CPython 运行时离线安装）和第 4 条（自动生成说明）**不进 Release notes**，
-  它们是恒定的打包口径、不是「这个版本变了什么」。应用中心里的 changelog 仍是完整 4 条
-  ——Release 只是发布时的过滤，不改 manifest 源数据。切分口径与 `ENTRY_SPLIT_RE` 一致
-  （`<br><br>` 后紧跟版本号才算条目边界），取不到两行时直接报错而不是发空正文。
-- **更新日志第 1 条会带上上游这次的说明**：脚本会取上游 Release 的「本次更新内容」段，
-  清洗成一行塞进第 1 条（如 `1.上游 MoviePilot v3.1.6 更新内容——优化在线升级流程…`）。
-  设计要点：
-  - 用 `releases/latest` 而**不是** `releases/tags/<tag>` —— 后者返回的是轻量 schema，
-    `body` 往往是空的；用 latest 则必须校验 `tag_name` 与目标 tag 完全相等，否则不写摘要
-    （避免把新版本的说明写进旧版本的日志）。
-  - 只取「本次更新内容」段，**刻意不取「完整变更记录」** —— 那段是 `feat(update): …` 的
-    逐条 commit 列表，中英混杂，不适合放进应用中心。
-  - 半角 `;` 会被归一为全角 `；`。这是**硬约束**：fnpack 遇到半角分号会截断整行取值，
-    而 `check_manifest_values()` 是抛异常（不是回退），一个分号就能让整条发布流程失败。
-  - 上游条目自带的 `1. 2. 3.` 编号会被剥掉、改用 `；` 连接，避免与外层的 4 条编号打架。
-  - **任何失败都回退到固定文案**（网络/限流/tag 不匹配/正文为空/清洗后为空），
-    摘要只是锦上添花，绝不能让每周的发布流程中断。
-  - 摘要上限 200 字符（Unicode 字符数），单条 90 字符，最多 3 条。
-- **打包口径（第 2、3 条）在 Actions 日志里也能看到**：`上游源码零改动原样集成…` 与
-  `自带 CPython x.y.z 运行时与全部依赖，安装时无需联网` 这两条以前只存在于 manifest 里，
-  要装完包在应用中心才看得到。现在 `tools/bump_upstream.py` 改完 manifest 后会把**整段更新日志
-  原文回打**到运行日志（`log_packaging_notes()`），`check-upstream.yml` 的 Job Summary 也会在
-  表格下面追加「打包说明」一节。三处（manifest / 运行日志 / Summary）共用
-  `packaging_lines()` 这一份文案、CPython 版本号由 `build.py` 派生，`bump_upstream_smoke.py`
-  的 L 组用例钉住它们逐字一致（避免日志里写的版本与实际打包的版本漂移）。
-- **强制重打当前版本**：手动跑本 workflow 并勾上 `force`（用于验证流水线）。此时 `version`
-  已经是目标值，脚本**不会**再动 `changelog`，因此反复重跑也不会往里面塞重复条目。
-  （顺带：版本未变时也**不会**去抓上游说明，省一次 API 配额。）
-- **手动补发某个版本**：跑 `build-and-release.yml`，ref 填对应 tag。
-
-> 本地也可以跑同一套逻辑（不需要 CI）：`python tools/bump_upstream.py --detect` 只看有没有更新，
-> `--apply` 真去改文件；不带 `GITHUB_TOKEN` 时受匿名 API 限流（60 次/小时）。
->
-> 「只保留最新一条」这条口径由 `tools/bump_upstream_smoke.py` 离线冒烟测试钉住（不联网，
-> 沙箱内造一份含三条历史条目的 manifest，断言改完只剩一条）。改 `MAX_CHANGELOG_ENTRIES`
-> 或去掉「版本未变就不动 changelog」的守卫都会让它失败 —— 这两处一旦被改，累积就会悄悄回来。
-> 上游摘要的清洗/截断/分号归一/回退矩阵同样由该文件覆盖（H/I/J/K 四组，共 30 余项断言）。
+| 系统 | 飞牛 fnOS |
+| 架构 | `amd64` 或 `arm64`（分别构建，不可混用） |
+| 运行时 | Node.js `nodejs_v24`（应用中心自动依赖安装）；Python 已自带 |
+| 构建 | 打 `--with-runtime` 包需 **Linux/macOS** 构建机，且架构与目标 NAS 一致 |
 
 ## 安装
 
-在 fnOS 应用中心「手动安装」上传 `.fpk`，或使用 `appcenter-cli`：
+在 fnOS 应用中心「手动安装」上传 `.fpk`，或：
 
 ```bash
 appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 ```
 
-安装向导会收集：
-- 超级管理员用户名 / 密码
-- 后端端口（默认 3002）、前端端口（默认 3005）
+安装向导会收集**超级管理员用户名 / 密码**、**后端端口**（默认 3002）、**前端端口**（默认 3005）。安装时自动初始化 SQLite 数据库并创建管理员。
 
-安装时会自动：
-1. 准备 Python 环境（优先使用 `--with-runtime` 构建时打包的自带 CPython 3.14 + 全部依赖）
-2. 初始化 SQLite 数据库并创建超级管理员
-
-> - **构建时用了 `--with-runtime`**（CI 产物即如此）：安装时完全不联网，开箱即用。安装脚本会先自检解释器与核心依赖，不自检通过就明确失败，不会留下「安装成功但起不来」的应用。
-> - **未用 `--with-runtime`**（如 Windows 本地构建）：安装时尝试用 fnOS `python312` 建 venv 并 `pip install` 依赖（走国内加速源）。但 `manifest` 已不再声明 `python312`，且依赖要求 `requires-python >= 3.14`，这条路径实际上装不上 —— 它只是给本地开发留的降级分支，**请使用 CI 产物或 Linux/macOS 上带 `--with-runtime` 构建**。
+> 请使用 CI 产物或 Linux/macOS 上带 `--with-runtime` 构建的包。未自带运行时的包安装时会尝试用 fnOS `python312` 建 venv 装依赖，但上游要求 `>= 3.14`，这条路径实际不可用，仅作本地开发降级。
 
 ## 使用
 
-安装完成后，在 fnOS 桌面点击 MoviePilot 图标即可打开 Web 界面（嵌入 iframe）。数据存储于：
+安装后在 fnOS 桌面点击 MoviePilot 图标即可打开（嵌入 iframe），首个登录使用向导设置的管理员账号。
 
 | 用途 | 位置 |
 |------|------|
 | 配置 / 数据库 | `TRIM_PKGVAR/config`（持久） |
 | 下载目录 | `TRIM_DATA_SHARE_PATHS` 共享目录 |
-| 媒体库目录 | 用户在应用设置中授权 |
+| 媒体库目录 | 在应用设置中授权 |
+| 更新日志 | `TRIM_PKGVAR/update.log` |
+| 更新状态 | `TRIM_PKGVAR/config/mp_update.json` |
 
-可在应用设置中修改端口、重置超级管理员密码。
+端口与超级管理员密码可在应用设置中修改。
+
+## 架构
+
+```
+浏览器 (fnOS 桌面 iframe)  ──/app/moviepilot/...──▶  fnOS 统一网关（校验登录态）
+                                                         │ moviepilot.sock
+                                                         ▼
+                              gateway-proxy.py（剥离前缀 + JS polyfill + WS 隧道）
+                                                         │
+                              Node 前端 frontend-server.js :3005（静态资源 + /api 代理）
+                                                         │
+                              Python 后端 app/main.py :3002
+```
+
+`gateway-proxy.py` 会把 `Authorization` 改名为 `X-MP-Auth` 再发出（fnOS 网关会把该头当成自己的令牌校验，不通过就返回 `200 text/plain "invalid token"`，请求到不了应用），代理转发时再还原。
 
 ## 上游自动更新（重启即升级）
 
-上游 MoviePilot 发布新版本时**不需要重新构建 fpk**：应用每次启动（含重启）前会
-自动检查上游 Release，有新版本就下载并就地替换后端源码与前端 dist，然后用新代码启动。
+上游发新版本时**不需要重新构建 fpk**：应用每次启动（含重启）前检查上游 Release，有新版就下载并就地替换后端源码与前端 dist，然后用新代码启动。
 
-**站点资源（站点认证扩展 + 站点索引）走同一条"重启即更新"路径**，但它是**独立的
-发布通道**（`jxxghp/MoviePilot-Resources`，版本号与主程序毫无关系），所以单独检查、
-单独开关、单独冷却。详见下文「站点资源同步」。
+- 主程序与**站点资源**（站点认证扩展 + 站点索引）是**两条独立发布通道**，各自检查、各自开关与冷却
+- 更新流程：查版本 → 下载后端 zip（校验结构与版本）→ 依赖预检 → 备份替换（含资源包回填）→ 前端 dist 替换 → 自检（失败**整树回滚**）→ 写状态文件（保留最近 2 代备份）
+- 若 MoviePilot 界面已下载过更新包（`config/temp/movietpilot-update/`），更新器直接复用，不重复下载
+- 版本发现四级降级：`api.github.com` 直连 → 网页 `releases/latest` → `releases.atom` → 分支 `version.py`
+- 上游对同一版本重新打包（如 `v3.0.10-1`）按**正式版**处理，且 `v3.0.10-1 > v3.0.10`
 
-### 为什么不用 MoviePilot 自带的更新功能
-
-上游 V3 确实有 `SystemUpdateManager`（界面里的"检查更新/下载/安装"），但它在 fnOS 上
-三步里断了后两步（v3.0.3 源码核实）：
-
-| 阶段 | 上游实现 | 在 fnOS 包里 |
-|------|----------|--------------|
-| 检查 | 定时任务，受 `MOVIEPILOT_AUTO_UPDATE` 控制（默认关闭，官方注释：只提示、不自动下载安装） | 可用 |
-| 下载 | 界面点"下载"，但非 Docker 时 `_prepare_local_backend_ref()` 要求程序目录是 **git 仓库** | 不可用（fpk 解包无 `.git`） |
-| 安装 | 非 Docker 时 `apply_prepared_update()` 直接返回"当前运行环境不是 Docker"（`is_docker()` 只看 `/.dockerenv`），本地路径还要 `git` + `uv` 重建 venv | 不可用 |
-
-且"重启后应用已下载包"这一步挂在 CLI 的 `start`/`restart` 里，本应用由 supervisor
-直接 `python app/main.py` 启动，压根不经过 CLI。所以改为自研更新器：
-**下载 Release 压缩包 + 目录级替换**，只依赖标准库，不需要 git / uv。
-
-站点资源那边是同一个道理：上游 `ResourceHelper` 能算出"资源有新版"，但
-`apply_prepared_update()` 同样是 Docker-only，`install_update` 又要 `can_restart()`
-（本包由 supervisor 而非 CLI 启动，恒为 false）。所以资源也由自研更新器直接接管。
-
-### 工作流程
-
-1. 读本地版本（`mp/version.py`）→ 查上游最新版本 → 版本更高才继续（无更新时只做一次 API 查询，秒级返回）
-   版本发现是**四级降级**：`api.github.com` **直连**（不走加速）→ 网页 `releases/latest` → `releases.atom` → 分支 `version.py`（raw 文件型 URL）。后三级都落在 `github.com` / `raw.githubusercontent.com` 上、可走加速前缀 —— 加速镜像普遍只转发「文件」型 URL（实测当前两个镜像 `gh.dpik.top` / `v4.gh-proxy.org` 对 releases 网页/订阅源分别返回 404 与 403/301，对归档与 raw 正常），所以第 2、3 级在这两个镜像下都会失败，实际可用的是第 1 级（API 直连）与第 4 级（raw）
-   > tag 形态认 `v3.x.y` 与上游的重新打包序号 `v3.x.y-N`（如 `v3.0.10-1`，正式版而非预发布，
-   > 且 `v3.0.10-1 > v3.0.10`）；v1/v2 历史 tag 与 `dev` 之类非版本引用一律不接受。
-2. 下载后端 zip → 校验结构（有 `app/`、`version.py` 与 tag 一致）→ 解析出 `FRONTEND_VERSION`
-3. 依赖预检：用新 `uv.lock` 对比已装环境，缺什么补什么（`pip`，走国内镜像）
-4. 备份 → 替换 `app/ config/ database/ scripts/ skills/ moviepilot/` 与 `version.py` 等 → **回填资源包文件**（sites 二进制来自独立仓库，上游 zip 里没有）→ 校验资源在位（缺失直接判更新失败并回滚）
-5. 前端 dist 整体替换
-6. 自检（关键依赖 import + 源码语法编译），**失败即整树回滚**
-7. 写状态文件，保留最近 2 代备份
-
-另外：如果 MoviePilot 界面已经下载过更新包（`config/temp/movietpilot-update/`），
-更新器会**直接复用**它，不重复下载。
-
-### 站点资源同步（认证扩展 + 站点索引）
-
-站点资源**不在主程序仓库里**，由 `jxxghp/MoviePilot-Resources` 单独发布，运行时需要
-恰好两个文件（`resources.v3/`，与主程序版本无关）：
-
-| 文件 | 作用 | 上游版本号 |
-|------|------|-----------|
-| `user.sites.v3.bin` | 站点索引（Fernet 密文，含各站点定义） | `3.0.17` |
-| `sites.cpython-<ABI>-<arch>-linux-gnu.so` | 站点认证扩展（Cython 编译的 `SitesHelper`） | `3.0.4` |
-
-工作流程（`mp_updater.py --resources`）：
-
-1. 用后端解释器导入 `app.application.site.sites`，读出**真实的**本地资源版本
-   （读不到才退回状态文件，再退回 `"0"` —— `"0"` 必然小于清单里的任何版本，最坏只是多下一次）
-2. 拉上游 `package.v3.json`，按平台 / ABI 选出本机需要的两个文件，逐项校验清单
-   （必须覆盖本机所需文件、类型已知、平台匹配、`target` 指向约定目录、版本号非空）
-3. 版本有更新 → 从 **raw 文件型 URL** 下载到暂存目录（走加速前缀；不用 `api.github.com`）
-4. 旧文件 rename 进备份 → 安装 → 校验（文件在位 + ABI 名 + 版本号）
-5. 任一步失败：**整批回滚**到旧资源，只记录错误，**不阻塞启动**
-
-四条硬约束，每条背后都有事故：
-
-- **索引与扩展必须成对替换**。索引是密文，其格式由扩展约定；旧索引配新扩展会解出空
-  站点列表 —— 表现是「站点认证」页 `No data available`，而文件一个都不少。所以下载
-  全部成功才动运行目录，绝不出现"扩展换了、索引没换"的中间态。
-- **只装 ABI 匹配的扩展**。ABI 标签取自后端解释器（`cp314` / 自由线程构建是 `cp314t`），
-  不符是 `ImportError`，后端直接起不来。上游同时分发 `cp311`–`cp314t` 各平台版本，
-  按 ABI 选错一个就废。
-- **只认 `RESOURCE_FLAG` 这一代（v3）**。上游同时分发 `resources.v2` / `resources.v3`，
-  装错一代同样解不开索引。
-- **失败绝不阻塞启动**。资源旧一点只是站点少；起不来是全站不可用。因此调用点写的是
-  `run_updater --resources --auto || true`，且退出码 `11` 被当作"成功"处理。
-
-> 版本比较**不信状态文件**。fpk 重装会把 `app/` 换回打包时的资源，而
-> `CONFIG_DIR/mp_update.json` 是持久化的 —— 只信状态文件的话，重装后那个"更高的版本号"
-> 会让检查永远判定"已最新"，站点资源再也升不上去。所以以真实探测为准。
-
-> 资源备份在 `<应用目录>/.mp-res-backup/`，与主程序备份 `.mp-backup/` **同级而非嵌套**：
-> 若嵌在里面，`--rollback`（按目录名取最近一次）会把只含两个资源文件的目录当成主程序
-> 备份去恢复。
-
-### 开关（`app.env`，也可在应用设置里切换）
+### 开关（`app.env`，应用设置里可切换）
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `MP_AUTO_UPDATE` | `1` | 主程序自更新总开关，应用设置里有下拉可选 |
+| `MP_AUTO_UPDATE` | `1` | 主程序自更新总开关 |
 | `MP_UPDATE_CHANNEL` | `release` | `release` 仅正式版 / `prerelease` 含测试版 / `off` 关闭 |
-| `MP_UPDATE_INTERVAL` | `21600` | 检查间隔（秒），避免每次重启都查 GitHub；**站点资源共用此间隔，各记各的时间戳** |
-| `MP_UPDATE_DEPS` | `1` | 是否同步 Python 依赖；关闭且新版本有新增依赖时会**拒绝更新**（避免装出起不来的版本） |
-| `MP_AUTO_UPDATE_RESOURCE` | `1` | 是否同步站点资源（认证扩展 + 索引），应用设置里有下拉可选 |
-| `GITHUB_PROXY` | `https://gh.dpik.top/` | 加速前缀，**只作用于 `github.com` 系 URL**（归档下载、网页兜底版本发现）；`api.github.com` 一律直连，不受它影响 |
-| `GITHUB_PROXY_MIRRORS` | `https://v4.gh-proxy.org/` | 额外加速前缀，逗号分隔（如 `https://a/,https://b/`）。内置镜像失效时可不动代码换一批 |
+| `MP_UPDATE_INTERVAL` | `21600` | 检查间隔（秒）；站点资源共用此间隔，各记各的时间戳 |
+| `MP_UPDATE_DEPS` | `1` | 是否同步 Python 依赖；关闭且新版有新增依赖时会**拒绝更新** |
+| `MP_AUTO_UPDATE_RESOURCE` | `1` | 是否同步站点资源 |
+| `GITHUB_PROXY` | `https://gh.dpik.top/` | 加速前缀，只作用于 `github.com` 系 URL；`api.github.com` 一律直连 |
+| `GITHUB_PROXY_MIRRORS` | `https://v4.gh-proxy.org/` | 额外加速前缀，逗号分隔，如 `https://a/,https://b/` |
 
-> 内置加速前缀顺序：`gh.dpik.top` → `v4.gh-proxy.org`（可用 `GITHUB_PROXY` / `GITHUB_PROXY_MIRRORS` 覆盖或追加）。
-> ⚠️ `v4.gh-proxy.org` 必须带 `v4.` 前缀，裸 `gh-proxy.org` 基本不通。
-> 已从内置列表移除：`gh-proxy.com` / `gh-proxy.org`（本机连不上或速度≈0，60s 只收到 0.5MB）；`ghfast.top`（对 `jxxghp/*` 全量返回 `403 Forbidden by black list`，对本项目无效）。
-> ⚠️ `gh.dpik.top` 是个人运营的第三方服务，仅作加速用途；介意供应链风险可自行换成自建或可信镜像。
-
-> 版本发现失败时不占用整个检查间隔：只冷却 15 分钟就重试（网络抖动不该让自动更新停摆半天）。
-> 四级降级带时间预算（API 直连 15s、单次请求 10s、整体 120s），所以更新检查不会把启动拖成几分钟。
-> 站点资源同理，且同一版本连续失败 2 次后跳过（`--force` 可强制重试）。
+> 内置加速前缀顺序：`gh.dpik.top` → `v4.gh-proxy.org`。`v4.gh-proxy.org` 必须带 `v4.` 前缀。
+> 已移除：`gh-proxy.com`（速度≈0）、`ghfast.top`（对本仓库全量 403）。
+> `gh.dpik.top` 是个人运营的第三方服务，介意供应链风险可换成自建或可信镜像。
 
 ### 手动操作与回退
 
 ```bash
-# 立即检查并更新主程序（忽略冷却）；应用运行中会先停后启
-/var/apps/moviepilot/target/cmd/main update
-# 只看有没有新版本，不动任何文件（主程序 + 站点资源）
-/var/apps/moviepilot/target/cmd/main update-check
-# 立即同步站点资源（认证扩展 + 站点索引），忽略冷却
-/var/apps/moviepilot/target/cmd/main resources
-# 回滚到更新前的版本（备份在 <应用目录>/.mp-backup/）
-/var/apps/moviepilot/target/cmd/main rollback
-# 修复站点资源（sites 模块错位/缺失导致后端起不来时，纯本地、无网络）
-/var/apps/moviepilot/target/cmd/main repair
+cd /var/apps/moviepilot/target
+./cmd/main update          # 立即检查并更新主程序（忽略冷却）
+./cmd/main update-check    # 只看有没有新版本，不动任何文件
+./cmd/main resources       # 立即同步站点资源（认证扩展 + 站点索引）
+./cmd/main rollback        # 回滚到更新前的版本（备份在 <应用目录>/.mp-backup/）
+./cmd/main repair          # 修复站点资源（模块错位/缺失导致起不来时，纯本地、无网络）
 ```
 
-更新日志：`TRIM_PKGVAR/update.log`；状态文件：`TRIM_PKGVAR/config/mp_update.json`。
+> `repair` 是离线自愈（按当前源码结构重新对位资源文件）；`resources` 是在线升级（比对版本并下载）。启动路径两个都跑：先 `repair` 再 `resources`。
+> 通过 fpk 重新安装/升级应用时，应用目录被整包替换，自更新内容随之回到安装包版本 —— 这是预期行为，也让「装包升级」始终是可靠的回退路径。
 
-> `repair` 与 `resources` 的分工：`repair` 是**离线自愈**（把资源文件按当前源码结构
-> 重新对位，无网络、无版本比较，只保证"在正确的位置且能加载"）；`resources` 是**在线
-> 升级**（比对上游版本并下载新版）。启动路径两个都会跑：先 `repair` 再 `resources`。
+## 从源码构建
 
-> 注意：通过 fpk 重新安装/升级应用时，应用目录会被整包替换，自更新的内容随之回到
-> 安装包自带的版本（这是预期行为，也让"应用包升级"始终是可靠的回退路径）。
+```bash
+python build.py                       # 下载源码 + 前端并打包
+python build.py --with-runtime        # 自带 CPython 3.14 + 全部依赖（仅 Linux/macOS，推荐）
+python build.py --with-runtime --no-build   # 严格模式：禁止源码构建，只用预编译 wheel
+python build.py --force               # 强制重新下载外部资源
+python build.py --clean               # 构建前清理 .local-build
+python build.py --arch arm64          # 显式声明目标架构
+python build.py --skip-mp / --skip-fe # 跳过下载后端 / 前端
+```
 
-### 应用中心装包升级的耗时构成
+构建脚本会：下载 `UPSTREAM_TAG` 钉住的上游源码 → 下载前端 `dist.zip` → 同步站点资源包 →（可选）装配 CPython 运行时与依赖 → 组装目录树并用 fnpack 打 `.fpk`。
 
-`upgrade` 由 `upgrade_init` → 整包替换 → `upgrade_callback` 三段组成。
+所有构建产物收敛在 `.local-build/`（已 gitignore），项目根不残留。
 
-| 阶段 | 内容 | 说明 |
-|------|------|------|
-| `upgrade_init` | 停服务 + 备份 config | 停服务最多等 30s（后端要收敛在途任务）；备份按**硬链接 → reflink → 全量拷贝**降级，同文件系统下近乎瞬时 |
-| 整包替换 | fnOS 解压 fpk 覆盖 `TRIM_APPDEST` | **耗时主项**，且生命周期脚本无法干预（见下） |
-| `upgrade_callback` | 运行时自检 + 数据库迁移 + 重启 | 自带运行时时**跳过 pip**（只做秒级 import 自检）；重启带 `MP_SKIP_UPDATE=1` |
+打包口径：
 
-#### 关键结论：解压耗时的瓶颈是**文件数**，不是体积
+- **只构建当前上游版本**：`build.py` 的 `UPSTREAM_TAG` 钉死上游 tag，同一次构建结果可复现；升级上游就是改这一个常量（`tools/bump_upstream.py` 自动改并同步 `manifest`）
+- **版本号 = 上游 tag**（去前导 `v`）：上游 `v3.0.10-1` → 应用版本 `3.0.10-1`，git tag 同名
+- **manifest 的 `changelog` 只保留当前版本一条**，每次跟进整条替换；Release 正文只取「版本号 + 第 1 条」
+- 打 tag 前须先同步 `manifest` 的 `version`，CI 会校验二者一致，不一致直接失败
 
-这一点反直觉，但实测方向一致。在真实 tar.gz 解压路径上做对照（同样解压到磁盘）：
+## CI
 
-| 对照 | 耗时 |
-|------|------|
-| 34,000 个文件 / 7.1 MB | **19.6 s** |
-| 340 个文件 / 7.1 MB（文件数降到 1/100，字节不变） | **0.21 s**（快约 90 倍） |
-| 34,000 个文件 / 0.7 MB（字节降到 1/10，文件数不变） | **约 20 s**（基本不变） |
+| workflow | 作用 | 触发 |
+|----------|------|------|
+| `.github/workflows/check-upstream.yml` | 检查上游新版本 → 改 pin/manifest → 提交 → 打 tag → 派发构建 | 每周二 11:23（北京时间）或手动 |
+| `.github/workflows/build-and-release.yml` | 分架构（`amd64` / `arm64`）打包并创建 Release | 上面派发、push `v*` tag、手动 |
 
-独立复核的受控矩阵同样印证：文件数 ×10 → 耗时 **+6.3~6.5 s**；体积 ×10 → 仅 **+0.4~0.7 s**。
-真实解压 33.96 s 中，纯顺序字节写入只占约 0.55 s。
+产物命名 `moviepilot-<version>-<arch>.fpk`。构建后校验包内 `app/python/bin/python3` 存在，并抽查 `fastapi/uvicorn/sqlalchemy/pydantic_core/orjson`。
 
-即**每个文件都要一次 inode 创建 + 元数据写 + close，这个固定成本远大于字节写入**。
-所以"把包压小"几乎没有意义，**减少文件数**才有效。
+> 本仓库约定：用内置 `GITHUB_TOKEN` 推的 tag **不会触发其它 workflow**，所以「改完 pin 打 tag」后由 `check-upstream.yml` 显式 `workflow_dispatch` 派发构建，而不是等 tag 触发。
 
-> 上表是本机（Windows/NTFS）实测，绝对秒数随磁盘与文件系统而变，方向与量级可复现。
+## 测试
 
-#### 为什么只能在构建期解决
+```bash
+python tools/updater_smoke.py     # 自更新器（主程序 + 站点资源 + 下载提速），全离线
+python tools/bump_upstream_smoke.py
+python tools/resources_smoke.py
+python tools/supervisor_smoke.py
+python tools/pkgsize_smoke.py
+python tools/cmd_env_smoke.py     # 需 bash
+python tools/polyfill_smoke.py    # 需 node，缺失则 SKIP
+```
 
-官方文档写明 `install_init` 在「安装文件应用**前**执行」、`install_callback` 在
-「安装文件应用**后**执行」，包文件写入发生在两者**之间**，由 fnOS 自己完成。
-因此任何"在 `cmd/` 脚本里挪动运行时"（解压后再删、延迟下载、事后搬移）的方案
-对装包耗时**完全无效** —— 字节和 inode 都已经写完了。只能减小包本身的文件数。
+## 已知限制
 
-#### 已实施的优化：保留符号链接
+- 产物体积数百 MB（自带解释器 + 全部依赖），这是「安装时零联网」的代价
+- 依赖优先用预编译 wheel（`anitopy`、`pinyin2hanzi` 只有 sdist，不能一刀切 `--no-build`）；wheel 的 manylinux 基线不得高于 glibc 2.36（fnOS / Debian 12）
+- MoviePilot 插件依赖由后端运行时 pip 装进 `app/python/site-packages`，**整包升级后需重新安装插件依赖**
+- 自更新要求应用目录（`TRIM_APPDEST`）可写；只读时跳过更新并记日志，只能靠重新装包升级
+- 自更新不替换 `app/python/` 运行时；新版引入新依赖时由更新器 pip 增量补装（需联网，走国内镜像）
+- 站点资源同步只替换认证扩展与站点索引两个文件，不动 `site-packages`
+- 默认 SQLite；需 PostgreSQL 时在 `app.env` 设 `DB_TYPE=postgresql` 并自行安装 PostgreSQL
+- 应用中心装包升级的耗时主要来自 fnOS 解压 fpk 本身，瓶颈是**文件数**而非体积，只能在构建期优化
 
-`shutil.copytree` 默认 `symlinks=False`，会把运行时里的链接解引用成实体副本，导致包里
-出现 3 份完全相同的 32.2 MB python 解释器与 2 份 `libpython3.14.so`（sha256 一致），
-白占约 **93 MB**。这些在真实 CPython 安装里本来就是符号链接。
+## 致谢与许可
 
-改为 `copy_tree_preserving_links`（`symlinks=True`）后只存一份实体 + 若干链接条目，
-并附带**链接审计**：任何指向包外的绝对链接都会被拦下并终止构建（否则包能在构建机跑、
-搬到 NAS 就断链）。
+基于 [MoviePilot](https://github.com/jxxghp/MoviePilot)、[MoviePilot-Frontend](https://github.com/jxxghp/MoviePilot-Frontend)、[MoviePilot-Resources](https://github.com/jxxghp/MoviePilot-Resources)（均 GPL-3.0，版权归 jxxghp），运行时来自 [python-build-standalone](https://github.com/astral-sh/python-build-standalone)（PSF-2.0）、依赖管理用 [uv](https://github.com/astral-sh/uv)（MIT / Apache-2.0），运行环境由 [fnOS](https://www.fnnas.com/) 提供。下载加速由 [gh.dpik.top](https://gh.dpik.top/)、[v4.gh-proxy.org](https://v4.gh-proxy.org/) 等镜像提供。
 
-构建期还会打印"打包写入代价"（各目录的体积**与文件数**占比），并对
-"`python/` 下 0 个符号链接"给出回归告警。
-
-#### 未能实施：lark_oapi 未使用业务域的裁剪（已实测证明不可行）
-
-`lark_oapi` 是全包**文件数最多的单个包** —— 11,112 个文件，占全包 34,689 个文件的
-**32%**，却只占 18.6 MB / 2.6% 体积。按"文件数主导"的结论，它本来是收益最大的目标：
-它自带飞书 OpenAPI **全部 58 个业务域**的自动生成 SDK（招聘 hire、人事 corehr、邮件、
-考勤……），而 MoviePilot 实际只用到 `im.v1`（消息）与 `cardkit.v1`（卡片）—— 这有上游
-自带的架构依赖基线 `mp/tests/fixtures/architecture/dependency-baseline.json` 逐条佐证。
-
-**但"只删 api/&lt;域&gt;/ 目录"必然失败**，因为 `lark_oapi` 的顶层导入链主动引用了全部域：
-
-| 文件 | 内容 |
-|------|------|
-| `lark_oapi/__init__.py` | `from .api import *` |
-| `lark_oapi/api/__init__.py` | **57 行 `from . import <域>`**（eager import） |
-| `lark_oapi/client.py` | **57 条 `from .api.<域>.service import <X>Service`**，每个类另在 `Client` 里有 3 处使用点 |
-
-删掉任一未保留域，`import lark_oapi` 立即 `ImportError`（飞书渠道整体失效）。
-要让裁剪生效只有两条路，**两条都已被评估为不可接受**：
-
-- **改写 wheel 内第三方源码**：实测需改约 112 条导入 + 165 处类引用，等于 fork 掉
-  `lark-oapi`；上游每次 bump 都可能静默失配，而失配的后果是**运行期**飞书功能炸，
-  不是构建期报错。收益（约 10,360 个文件）与长期维护风险不成比例。
-- **把域打包成 zip 用 zipimport 加载**：被裁的 56 个域确实全是纯 Python（zip 内 0 个
-  `.so`），文件数收益真实（11,138 → 780）。但 `lark_oapi` 无法自我挂载 zip 到
-  `sys.path`（它得先被 import 才能执行代码），必须靠 `.pth` / `sitecustomize` 从外部注入，
-  而这条注入链依赖 CPython 的 site 机制，**未能在真机启动路径上验证**，因此不采用。
-
-结论：**在"不改第三方库、不依赖未验证的注入链"的前提下，这个文件数瓶颈无法安全消除**。
-如将来要重启这项工作，请先读完上面两条评估，并注意若沿用目录删除方案，
-`victims` 必须排除 `api/__pycache__` 这类非业务域目录。
-
-#### 已做的小项
-
-- **`upgrade_init` 的配置备份不再无条件全量拷贝**。config/ 含 SQLite 库、插件、缓存与
-  图片，全量 `cp -a` 是实打实的 IO；故按代价从低到高降级：先用 `cp -al` 硬链接（秒级、
-  不占额外空间），不支持时退 `--reflink=auto`（btrfs/XFS 的 CoW 克隆），最后才全量拷贝。
-  每档都校验结果非空，避免静默留下半份备份 —— 恢复不到 `app.env` 会直接让应用起不来。
-- **`upgrade_callback` 的重启带 `MP_SKIP_UPDATE=1`，跳过启动前的联网更新检查**。这一刻
-  程序目录刚被整包替换，`version.py` 就是包里那份，远端查询的结论注定是"已是最新"。
-  而该检查是四级降级 + 120s 整体预算，在 `api.github.com` 直连不通的受限网络里不会快速
-  失败，要逐级走完 API → 网页 → atom → 分支 raw，算上 `--resources` 的第二遍，一次升级
-  能白烧一两分钟。跳过不影响正确性：`repair_resources`（纯本地、不联网）仍会执行，而下次
-  正常重启或手动 `cmd/main update` 仍照常联网检查。
-
-#### 验证方式
-
-回归断言见 `tools/pkgsize_smoke.py`（契约层 + 行为层），覆盖：符号链接是否被保留、
-链接审计能否拦住指向包外的链接、打包写入代价统计是否可用，以及"未重新引入 lark 目录裁剪"
-与"文件数主导"结论的登记。
-
-> **验收新包是否真的生效，不能只看测试通过** —— 那是源码文本断言，无法证明发出的包里
-> 真的保留了链接。要直接读 fpk：
-> ```bash
-> # 包内符号链接数应 > 0（修复前实测为 0）
-> python -c "import tarfile,io;t=tarfile.open('moviepilot-x.y.z-amd64.fpk','r:gz');print(sum(1 for m in tarfile.open(fileobj=io.BytesIO(t.extractfile('app.tgz').read()),mode='r:gz') if m.issym()))"
-> ```
-> 排查装包升级耗时，看 `TRIM_PKGVAR` 下的三份日志：`upgrade.log`（停服务 / 备份模式 /
-> 迁移 / 重启）、`install.log`（依赖安装）、`update.log`（联网检查与下载，每行带完整 URL，
-> 并标注实际通道 `直连` / `加速(镜像域名)` 与本次尝试的超时）。
-
-## 已知假设与限制
-
-- 本包为**原生 Native 应用**。MoviePilot V3 要求 `requires-python >= 3.14`，因此正常产物通过 `--with-runtime` 自带 CPython 3.14 与全部依赖（含 langchain、Rust 扩展等），安装时不联网，也**不需要 fnOS 的 python312**（`manifest` 已不再声明）
-- Node.js（`nodejs_v24`）是唯一仍需 fnOS 提供的运行时，用于前端静态服务
-- `--with-runtime` 需要在 **Linux/macOS** 构建机上执行（Windows 无法交叉准备 Linux 运行时）；且构建机架构需与目标 NAS 架构一致（amd64/arm64 分开构建，CI 用对应的原生 runner）
-- 依赖**优先使用预编译 wheel**，缺失时才源码构建 —— `anitopy`、`pinyin2hanzi` 是纯 Python 的 sdist-only 依赖（PyPI 上无 wheel），禁止构建会直接解析失败，因此不能一刀切 `--no-build`。风险由两道审计兜底：wheel 的 manylinux 基线不得高于 glibc 2.36（fnOS / Debian 12），且凡是本地编译出原生 `.so` 的一律终止构建（它链接的是构建机的 glibc 2.39）
-- 产物体积较大（自带解释器 + 全部依赖），预期在数百 MB 量级；这是「安装时零联网」的代价
-- MoviePilot 的插件依赖是在运行时用自身解释器的 pip 安装到 `app/python/` 的 `site-packages`。**升级会整包替换应用目录，插件依赖需要重新安装**
-- 自更新只替换后端源码与前端静态文件，不替换自带 Python 运行时（`app/python/`）；新版本引入新依赖时由更新器用 pip 增量补装（需要联网，走国内镜像）
-- 站点资源同步只替换站点认证扩展与站点索引两个文件（都在 `app/application/site/`），**不动** `site-packages`，因此更新成功后无需像主程序那样修正运行时权限
-- 自更新要求应用目录可写（`TRIM_APPDEST`）。目录只读时会跳过更新并记日志，此时只能通过重新安装应用包升级
-- 默认使用 **SQLite**；如需 PostgreSQL，可在 `app.env` 中设置 `DB_TYPE=postgresql` 并配置连接（需 fnOS 安装 PostgreSQL）
-- **版本号已改为上游派生**：`manifest` 的 `version` 与上游 tag 逐字对应（去前导 `v`），例如上游 `v3.0.10-1` → 本包 `3.0.10-1`。因此 git tag 从旧的 `v1.0.x` 系列跳到 `v3.0.10-1`，不再有本地构建计数器 —— 「换了哪份上游」一眼可见，也便于与上游 Release 对照
-- 后端源码、前端产物、自带 Python 运行时、fnpack 工具、下载缓存等**所有构建产物全部收敛在 `.local-build/`，不纳入 git**，由构建脚本生成；拉取仓库后需先执行构建脚本，项目根目录不残留任何构建产物
-- 首个登录使用安装向导设置的管理员账号
-
-## 感谢与上游仓库
-
-本应用基于以下开源项目封装为 fnOS 原生应用，在此一并致谢：
-
-| 上游项目 | 说明 |
-|----------|------|
-| [jxxghp/MoviePilot](https://github.com/jxxghp/MoviePilot) | 核心后端（FastAPI 媒体库自动化管理，本包使用的 V3 源码） |
-| [jxxghp/MoviePilot-Frontend](https://github.com/jxxghp/MoviePilot-Frontend) | Vue3 前端（官方预编译 `dist.zip`） |
-| [jxxghp/MoviePilot-Resources](https://github.com/jxxghp/MoviePilot-Resources) | 站点资源（sites 模块 / 索引数据，由独立仓库分发） |
-| [astral-sh/python-build-standalone](https://github.com/astral-sh/python-build-standalone) | 自带可重定位的 CPython 3.14 运行时（随包分发，安装零联网） |
-| [astral-sh/uv](https://github.com/astral-sh/uv) | 依赖锁定与安装（构建期按 `uv.lock` 装配 `site-packages`） |
-| [fnOS 应用中心](https://www.fnnas.com/) | 飞牛 fnOS 提供的运行环境（原生应用框架、统一网关与 Node.js 运行时） |
-
-构建与更新时的下载加速由 [gh.dpik.top](https://gh.dpik.top/)、[v4.gh-proxy.org](https://v4.gh-proxy.org/) 等 GitHub 镜像提供（直连不通时自动回退），一并致谢。
-
-## 许可证与免责声明
-
-本应用包（fnos-MoviePilot）**整体基于 GPL-3.0 发布**，封装代码（cmd/、app/bin/、wizard/、build.py 等）同样以 GPL-3.0 授权。许可证全文见仓库根 `LICENSE`，第三方组件许可见 `THIRD-PARTY-LICENSES`。
-
-- **MoviePilot 版权归 [jxxghp](https://github.com/jxxghp/MoviePilot) 所有**，以 GPL-3.0 发布；
-- **MoviePilot-Frontend / MoviePilot-Resources** 版权同样归 jxxghp，以 GPL-3.0 发布；
-- 自带 **CPython**（python-build-standalone 发行版）以 PSF-2.0 发布，其构建脚本以 MPL-2.0 发布；
-- **uv**（astral-sh）以 MIT 或 Apache-2.0 发布；**Node.js** 以 MIT 发布。
-
-GPL-3.0 允许学习、商用与再分发。本应用包仅为第三方封装，请自行评估使用风险。
+本应用包**整体基于 GPL-3.0 发布**，封装代码（`cmd/`、`app/bin/`、`wizard/`、`build.py` 等）同样以 GPL-3.0 授权。全文见 `LICENSE`，第三方许可见 `THIRD-PARTY-LICENSES`。本应用包仅为第三方封装，请自行评估使用风险。
