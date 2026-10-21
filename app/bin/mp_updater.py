@@ -61,8 +61,9 @@ MoviePilot fnOS 应用自更新器（重启即升级）
 
 注意：加速前缀只作用于 github.com 系 URL（归档下载、网页兜底版本发现）。
 api.github.com 一律直连，不走加速（镜像对它的支持参差不齐）。
-直连 → 加速是**顺序降级**：直连排第一，且有加速前缀可退时只给
-DIRECT_ATTEMPT_TIMEOUT（8s）判死，避免黑洞式直连挂满完整超时白等（见 _candidate_urls）。
+直连 → 加速是**顺序降级**：直连排第一（能通时最快也最安全），且有加速前缀可退时
+只给 DIRECT_ATTEMPT_TIMEOUT（8s）判死，避免黑洞式直连挂满完整超时白等 ——
+加速源清单本身参照 fnos-qbittorrent（见 _candidate_urls 与 DEFAULT_PROXIES）。
 超过探测阈值的包走**读超时压缩 + 分段并行 + 流式解包**三条提速路径，
 判据与实测依据见 DOWNLOAD_TUNING 一节与 download_file / fetch_zip 的说明。
 """
@@ -119,19 +120,30 @@ RAW_VERSION = "https://raw.githubusercontent.com/{repo}/{ref}/version.py"
 RAW_REFS = ("v3", "main", "master")
 
 # 加速前缀（顺序即尝试顺序），只作用于 github.com 系 URL。
-# 实测（本机 curl，125MB 大文件 + 本项目真实资产，各 3 轮）：
-#   gh.dpik.top      125MB 9~14s / 4~14 MB/s，3/3 成功  —— 最快
-#   v4.gh-proxy.org  125MB 12~18s / 7~10 MB/s，3/3 成功  —— 次之，波动最小
-# ⚠️ 本机直连 github.com 已完全不可用（归档 zip / Release / raw 全部超时），
-#    加速前缀是唯一可用的下载通道，这两项都必须保持有效。
+#
+# 清单与顺序**参照同作者的 fnos-qbittorrent**（app/bin/gateway-proxy.py 的
+# UPDATE_MIRRORS），四项逐字对齐 —— 那份文件是在真机上长期跑过的配置，不是这里
+# 临时选出来的：
+#   gh-proxy.com       多轮 0.95~6.4 MB/s，最稳
+#   v4.gh-proxy.org    与 gh-proxy.com 同一后端（x-github-request-id / etag /
+#                      x-cache-hits 完全一致），只能作节点切换，不是灾备
+#   ghfast.top         独立运营，抖动极大（1.8 MB/s ~ 100s 超时）
+#   ghproxy.imciel.com 独立运营，0.5~0.9 MB/s
+#
+# 本机复核（2026-10，39.8MB 真实前端包）：gh-proxy.com 完整拉完 64.8s，
+# v4.gh-proxy.org 174s 读超时（差 70KB），gh.dpik.top 258s 只收到 0.38MB
+# —— 旧列表里的 gh.dpik.top 长连接掉速到 0，已按参照文件移除。
+# ghfast.top 对本仓库曾返回 403（jxxghp/* 黑名单），但镜像侧策略会变，参照文件
+# 把它保留在第三位作为独立运营的备用节点；真挂了也只是白等一次 PROBE_TIMEOUT
+# 量级的时间，随后自动降级。
+#
 # 注意 v4.gh-proxy.org 只有带 v4. 前缀的子域可用，裸 gh-proxy.org 基本不通。
-# 网页/订阅源型 URL 两者都不转发（gh.dpik.top 404 / v4.gh-proxy.org 403·301），
-# 所以四级降级里的第 2、3 级（releases/latest、releases.atom）在这两个镜像下都会
-# 失败；第 1 级（api.github.com 直连）与第 4 级（raw version.py）仍然可用。
-# 已移除 gh-proxy.com / gh-proxy.org：本机连不上或速度≈0（60s 只收到 0.5MB）。
-# 已移除 ghfast.top：它对 jxxghp/* 全量返回 403 Forbidden by black list，
-# 对本项目完全无效，留着只会白等一个失败周期。
-DEFAULT_PROXIES = ("https://gh.dpik.top/", "https://v4.gh-proxy.org/")
+DEFAULT_PROXIES = (
+    "https://gh-proxy.com/",
+    "https://v4.gh-proxy.org/",
+    "https://ghfast.top/",
+    "https://ghproxy.imciel.com/",
+)
 
 # 传给 http_json 表示"不加任何加速前缀，只直连"。api.github.com 必须走这个：
 # 镜像对 api 域名的支持参差不齐，不支持时不会快速失败，而是一直挂到 SSL 握手
@@ -145,14 +157,11 @@ DISCOVERY_TIMEOUT = 10
 # 直连 api.github.com 只有一次机会（没有加速通道可退），给足时间
 API_TIMEOUT = 15
 # 直连尝试的超时上限（有加速前缀可退时才生效）。
-# 受限网络里直连 github.com 系域名常是**黑洞**：连接/等响应头阶段不回包也不发 RST，
-# 一次尝试会一路挂满调用方给的完整超时（大文件下载 60s、每个发现通道 10s）——更新
-# 日志里直连 dist.zip 正是 `<urlopen error timed out>` 白等 60s 才降级，而镜像 4s
-# 就拉完了同一份 39.8MB。这里给直连这一次设个短上限，判死即交给镜像。
 #
-# 若直连其实是"能连、只是慢"，这个值也不会误杀：socket 超时只在**完全收不到数据**
-# 时才触发，还在流动的连接不会被 8s 切断；被切掉的只有"连上却不再给数据"的假死，
-# 那种情况交给镜像本来就更划算（实测直连 0.2MB/s vs 镜像约 10MB/s）。
+# 策略是"先直连，超时再加速"，所以直连那一次必须有个短上限：受限网络里直连
+# github.com 系域名常是**黑洞**（连接/等响应头阶段不回包也不发 RST），不给上限
+# 就会一路挂满调用方给的完整超时。8s 足够判定"这条直连没戏"，且不会误杀
+# "能连、只是慢"的连接 —— socket 超时只在**完全收不到数据**时才触发。
 #
 # DIRECT_ONLY（api.github.com）没有可退通道，绝不缩短（见 _candidate_urls）。
 DIRECT_ATTEMPT_TIMEOUT = 8
@@ -501,25 +510,23 @@ def _mirror_host(mirror: str) -> str:
 
 
 def _candidate_urls(url: str, proxies: tuple, timeout: int) -> list:
-    """返回本轮要尝试的 [(URL, 该次尝试的超时秒数, 通道名)]：直连第一，加速前缀依次跟在后面。
+    """返回本轮要尝试的 [(URL, 该次尝试的超时秒数, 通道名)]：**直连第一，加速前缀依次跟在后面**。
 
-    通道名只为日志服务（`直连` / `加速(gh.dpik.top)`）：更新日志里"下载完成 xxx（39.8 MB）"
-    这种行看不出到底走的直连还是镜像，正是"重启自更新里没有用加速源么"这句话的由来。
-    前缀语法是 `https://镜像/原始URL`，所以从候选 URL 反推通道也不难，但让候选自己带上
-    标签能保证"记下来的就是真正请求的那条"，不会在调用点算错。
+    策略是"先直连，超时再加速"：直连能通时最快，也最安全（不经过第三方）；不通
+    才按加速前缀顺序降级。为了让"先直连"不至于把启动拖死，直连那次只给
+    DIRECT_ATTEMPT_TIMEOUT —— 受限网络里直连 github.com 系域名是黑洞，不给上限
+    就会挂满调用方给的完整超时（日志里的 `<urlopen error timed out>` 正是这一轮）。
+
+    加速候选仍用调用方给的完整超时，镜像慢一点不会被误杀；而"通道卡住就换下一条"
+    交给正文的读超时（`_read_timeout` / STALL_TIMEOUT），不靠砍整体超时实现。
 
     proxies 为空（DIRECT_ONLY，api.github.com）时只有直连一个候选，保持调用方给的
     完整超时 —— 那一次没有退路，必须给足，绝不缩短。
 
-    有加速前缀可退时，直连那一次只给 DIRECT_ATTEMPT_TIMEOUT。urlopen 的 timeout 覆盖
-    **连接 / TLS 握手 / 等响应头**这三个阶段，也正是实测故障发生的地方：更新日志里
-    直连 dist.zip 报的是 `<urlopen error timed out>`，从头到尾挂满 60s 才降级，而
-    镜像 4s 就拉完了同一份 39.8MB。8s 足够判定"这条直连没戏"，之后立刻交给镜像。
-
-    加速候选仍用调用方给的完整超时，镜像慢一点不会被误杀。
-
-    对**传输阶段**的影响可以忽略：同一个 timeout 只在"完全收不到数据"时才触发，
-    还在流动的连接不会被切断 —— 被切掉的只有连上却不再给数据的假死，正该降级。
+    通道名只为日志服务（`直连` / `加速(gh-proxy.com)`）：更新日志里"下载完成
+    xxx（39.8 MB）"这种行看不出到底走的哪条路，正是"重启自更新里没有用加速源么"
+    这句话的由来。前缀语法是 `https://镜像/原始URL`，从候选 URL 反推通道也不难，
+    但让候选自己带上标签能保证"记下来的就是真正请求的那条"，不会在调用点算错。
     """
     if not proxies:
         return [(url, timeout, "直连")]
@@ -580,11 +587,11 @@ def fetch_text(url: str, proxies: tuple, timeout: int = DISCOVERY_TIMEOUT,
 def _read_timeout(t: int) -> int:
     """把调用的完整超时压成"多久收不到新字节就放弃"。
 
-    顺序下载的 timeout 必须同时管两件事：判死黑洞式连接、以及在通道卡住时
-    尽快换下一条。前者要小（DIRECT_ATTEMPT_TIMEOUT 已经这样做了），后者过去
-    没人管：同一份包实测 gh-proxy.com 卡到 111s 才超时，而 STALL_TIMEOUT 就是
-    让它在 15s 收不到字节时立刻换镜像。注意它只作用于**读超时**语义 ——
-    连接还活着、字节还在进来时不会触发，所以慢通道不会被误判成失败。
+    顺序下载的 timeout 真正要管的是"通道卡住时尽快换下一条"：同一份包实测
+    v4.gh-proxy.org 卡到 174s、gh.dpik.top 卡到 258s 才超时（前者差 70KB 收尾、
+    后者收到 0.38MB 就停住），而 STALL_TIMEOUT 让它们在 15s 收不到新字节时立刻
+    换通道。注意它只作用于**读超时**语义 —— 连接还活着、字节还在进来时不会触发，
+    所以慢通道不会被误判成失败（39.8MB 包 64.8s 拉完的那条正是被允许跑完的）。
     """
     return min(t, STALL_TIMEOUT) if t else STALL_TIMEOUT
 

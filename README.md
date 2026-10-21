@@ -80,12 +80,13 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 | `MP_UPDATE_INTERVAL` | `21600` | 检查间隔（秒）；站点资源共用此间隔，各记各的时间戳 |
 | `MP_UPDATE_DEPS` | `1` | 是否同步 Python 依赖；关闭且新版有新增依赖时会**拒绝更新** |
 | `MP_AUTO_UPDATE_RESOURCE` | `1` | 是否同步站点资源 |
-| `GITHUB_PROXY` | `https://gh.dpik.top/` | 加速前缀，只作用于 `github.com` 系 URL；`api.github.com` 一律直连 |
-| `GITHUB_PROXY_MIRRORS` | `https://v4.gh-proxy.org/` | 额外加速前缀，逗号分隔，如 `https://a/,https://b/` |
+| `GITHUB_PROXY` | `https://gh-proxy.com/` | 加速前缀，只作用于 `github.com` 系 URL；`api.github.com` 一律直连 |
+| `GITHUB_PROXY_MIRRORS` | `https://v4.gh-proxy.org/,https://ghfast.top/,https://ghproxy.imciel.com/` | 额外加速前缀，逗号分隔，如 `https://a/,https://b/` |
 
-> 内置加速前缀顺序：`gh.dpik.top` → `v4.gh-proxy.org`。`v4.gh-proxy.org` 必须带 `v4.` 前缀。
-> 已移除：`gh-proxy.com`（速度≈0）、`ghfast.top`（对本仓库全量 403）。
-> `gh.dpik.top` 是个人运营的第三方服务，介意供应链风险可换成自建或可信镜像。
+> 下载策略：**先直连，超时再加速**（直连只给 8 秒判死）；加速源清单与顺序参照同作者的
+> fnos-qbittorrent：`gh-proxy.com` → `v4.gh-proxy.org` → `ghfast.top` → `ghproxy.imciel.com`
+> （与 `build.py` 的 `PROXIES` 逐项一致，H21b 钉住）。`v4.gh-proxy.org` 必须带 `v4.` 前缀。
+> 镜像均为第三方服务，介意供应链风险可换成自建或可信镜像。
 
 ### 手动操作与回退
 

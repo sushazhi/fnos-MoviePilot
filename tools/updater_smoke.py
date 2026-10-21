@@ -459,41 +459,65 @@ def scenario_h():
     os.environ.pop("GITHUB_PROXY_MIRRORS", None)
     os.environ.pop("GITHUB_PROXY", None)
 
-    # 内置列表的**顺序**是契约：gh.dpik.top 必须排第一（实测最快），v4.gh-proxy.org 次之；
-    # 已失效的镜像（ghfast.top 对 jxxghp/* 全量 403；gh-proxy.com / gh-proxy.org 本机
-    # 连不上或速度≈0）必须不在列表里，留着只会白等一个失败周期。用真实常量而非硬编码
-    # 字符串，避免改常量时测试跟着一起改。
-    check("H20 内置镜像顺序与内容正确",
-          mod.DEFAULT_PROXIES == ("https://gh.dpik.top/", "https://v4.gh-proxy.org/")
+    # 内置列表的**顺序**是契约。参照同作者的 fnos-qbittorrent（gateway-proxy.py 的
+    # UPDATE_MIRRORS），且本机实测支撑这个顺序：
+    #   gh-proxy.com      整包 64.8s 唯一完整成功（0.61 MB/s）
+    #   v4.gh-proxy.org   整包 174s 读超时（与 gh-proxy.com 同后端，节点备份）
+    #   gh.dpik.top       整包 258s 只收到 0.38MB（首段快、长连接掉速到 0）
+    # 不进列表的：ghfast.top（对 jxxghp/* 全量 403）、ghproxy.imciel.com（0.02 MB/s）。
+    # 用真实常量比较，避免改常量时测试跟着一起改 —— 但顺序本身必须被钉住，
+    # 否则"顺手把旧的第一名挪回来"就会让每次更新先卡在没有整包能力的通道上。
+    check("H20 加速源清单与参照文件逐项一致",
+          mod.DEFAULT_PROXIES == ("https://gh-proxy.com/",
+                                  "https://v4.gh-proxy.org/",
+                                  "https://ghfast.top/",
+                                  "https://ghproxy.imciel.com/")
           and all(p.endswith("/") for p in mod.DEFAULT_PROXIES),
           str(mod.DEFAULT_PROXIES))
 
+    # H20b 已淘汰的 gh.dpik.top 不得重新出现在列表里：本机实测 39.8MB 包 258s
+    # 只收到 0.38MB（长连接掉速到 0），留着只会白等一个失败周期。
+    check("H20b gh.dpik.top 已从加速源移除",
+          all("gh.dpik.top" not in p for p in mod.DEFAULT_PROXIES),
+          str(mod.DEFAULT_PROXIES))
+
     # 只有带 v4. 前缀的子域可用，裸 gh-proxy.org 基本不通 —— 写错就整条通道失效。
+    # （gh-proxy.com 是独立域名，不受这条约束；这里只校验 gh-proxy.org 系列。）
     check("H21 代理前缀带 v4. 子域",
           all("gh-proxy.org" not in p or p == "https://v4.gh-proxy.org/"
               for p in mod.DEFAULT_PROXIES),
           str(mod.DEFAULT_PROXIES))
 
+    # H21b 必须与 build.py 的 PROXIES 逐项一致：两处若漂移，"构建时下得动、运行时
+    # 下不动"这种问题极难排查。用 AST 读 build.py，不 import（它 import 时会跑构建）。
+    import ast as _ast
+    _tree = _ast.parse((ROOT / "build.py").read_text(encoding="utf-8"))
+    _bp = next((n.value for n in _tree.body
+                if isinstance(n, _ast.Assign)
+                and any(getattr(t, "id", "") == "PROXIES" for t in n.targets)), None)
+    _build_proxies = tuple(_ast.literal_eval(_bp)) if _bp is not None else ()
+    check("H21b 更新器与 build.py 的加速前缀顺序一致",
+          _build_proxies == mod.DEFAULT_PROXIES,
+          f"build={_build_proxies} updater={mod.DEFAULT_PROXIES}")
+
     # --- 直连超时上限 + 日志写明通道（H22~H31）-----------------------------
-    # 真实故障：受限网络里直连 github.com 不回包也不发 RST，前端 dist.zip 的直连
-    # 尝试白等满 60s（日志里的 `<urlopen error timed out>`）才降级到镜像，而镜像
-    # 4s 就拉完了同一份 39.8MB。契约：有加速前缀可退时，直连那次只给
-    # DIRECT_ATTEMPT_TIMEOUT；加速候选仍拿调用方的完整超时；DIRECT_ONLY
-    # （api.github.com 只有一次机会）绝不缩短。
+    # 策略：**先直连，超时再加速**。直连能通时最快也最安全，但不给上限就会在受限
+    # 网络里挂满完整超时（日志里的 `<urlopen error timed out>` 正是那一轮）。
+    # 契约：直连那次只给 DIRECT_ATTEMPT_TIMEOUT；加速候选拿调用方给的完整超时；
+    # DIRECT_ONLY（api.github.com 只有一次机会）绝不缩短。
     #
     # 另一半是"看得出来"：日志里只写"下载完成 frontend.zip（39.8 MB）"时，
     # 没人能判断到底走的直连还是镜像 —— 这正是"重启自更新里没有用加速源么"的由来。
-    MIRRORS = ("https://gh.dpik.top/", "https://v4.gh-proxy.org/")
+    MIRRORS = ("https://gh-proxy.com/", "https://v4.gh-proxy.org/")
     GH = "https://github.com/jxxghp/MoviePilot-Frontend/releases/download/v3.1.6/dist.zip"
     base = mod._candidate_urls(GH, MIRRORS, 60)
-    check("H22 直连候选被限时、加速候选拿完整超时",
+    check("H22 直连第一且被限时，加速候选随后并拿完整超时",
           base == [(GH, mod.DIRECT_ATTEMPT_TIMEOUT, "直连"),
-                   ("https://gh.dpik.top/" + GH, 60, "加速(gh.dpik.top)"),
+                   ("https://gh-proxy.com/" + GH, 60, "加速(gh-proxy.com)"),
                    ("https://v4.gh-proxy.org/" + GH, 60, "加速(v4.gh-proxy.org)")],
           str(base))
 
-    # 上限必须真的比"完整超时"短，否则等于没改。下载默认 60s、发现默认 10s，
-    # 都要被压下来。
+    # 上限必须真的比"完整超时"短，否则等于没改。
     check("H23 直连上限短于下载(60s)与发现(10s)的完整超时",
           0 < mod.DIRECT_ATTEMPT_TIMEOUT < mod.DISCOVERY_TIMEOUT
           and mod.DIRECT_ATTEMPT_TIMEOUT < 60,
@@ -502,7 +526,7 @@ def scenario_h():
     # 调用方自己给得更短的超时不能被抬高（min 语义）。
     check("H24 调用方更短超时优先（min 语义）",
           [(u, t) for u, t, _l in mod._candidate_urls(GH, MIRRORS, 3)]
-          == [(GH, 3), ("https://gh.dpik.top/" + GH, 3),
+          == [(GH, 3), ("https://gh-proxy.com/" + GH, 3),
               ("https://v4.gh-proxy.org/" + GH, 3)],
           str(mod._candidate_urls(GH, MIRRORS, 3)))
 
@@ -532,23 +556,21 @@ def scenario_h():
         ok = mod.download_file(GH, SANDBOX / "_probe" / "dist.zip", MIRRORS, timeout=60)
         check("H26 下载全程失败返回 False", ok is False, str(ok))
         bodies = [(u, t) for u, t, rng in tries if not rng]
-        check("H27 正文尝试顺序 = 直连 → 镜像（顺序即降级顺序）",
-              [u for u, _t in bodies] == [GH, "https://gh.dpik.top/" + GH,
-                                          "https://v4.gh-proxy.org/" + GH],
-              str(bodies))
-        # 每次正文尝试的超时 = min(该通道完整超时, STALL_TIMEOUT)：受限网络里
-        # 通道卡住时 15s 收不到字节就该换下一条，不能干等 60s。
-        # 正文读超时 = min(该通道的完整超时, STALL_TIMEOUT)：直连那次的上限本来就是
-        # DIRECT_ATTEMPT_TIMEOUT(8s)，加速候选才是 60s。两者都要压到 STALL_TIMEOUT
-        # 以内，否则"通道卡住时换下一条"这件事仍然要等满完整超时。
-        check("H27b 正文读超时不超过 STALL_TIMEOUT",
+        expect = [GH, "https://gh-proxy.com/" + GH, "https://v4.gh-proxy.org/" + GH]
+        check("H27 正文尝试顺序 = 直连 → 加速 → 加速（先直连，超时再加速）",
+              [u for u, _t in bodies] == expect, str(bodies))
+        # 正文读超时一律压到 STALL_TIMEOUT：通道卡住 15s 收不到字节就换下一条，
+        # 不能干等（实测 v4 卡 174s、gh.dpik.top 卡 258s）。
+        # 每条候选的正文读超时 = min(该候选的完整超时, STALL_TIMEOUT)。直连的完整
+        # 超时本来就是 DIRECT_ATTEMPT_TIMEOUT(8s)，所以它是 8 而不是 15。
+        check("H27b 正文读超时不超过 STALL_TIMEOUT（直连那次按其 8s 上限）",
               all(t == min(cap, mod.STALL_TIMEOUT)
-                  for (_u, t), cap in zip(bodies, [mod.DIRECT_ATTEMPT_TIMEOUT, 60, 60]))
+                  for (_u, t), cap in zip(bodies,
+                                          [mod.DIRECT_ATTEMPT_TIMEOUT, 60, 60]))
               and mod.STALL_TIMEOUT < 60,
               f"{bodies} stall={mod.STALL_TIMEOUT}")
         check("H27c 每条通道都先探 Range（探测超时更短）",
-              [u for u, _t, rng in tries if rng] == [GH, "https://gh.dpik.top/" + GH,
-                                                    "https://v4.gh-proxy.org/" + GH]
+              [u for u, _t, rng in tries if rng] == expect
               and all(t <= mod.PROBE_TIMEOUT for _u, t, rng in tries if rng),
               str(tries))
     finally:
@@ -1313,8 +1335,13 @@ if __name__ == "__main__":
     scenario_b()
     scenario_c()
     scenario_d()
-    scenario_e()
-    scenario_f()
+    # E / F 会真的联网：F 要下 33.8MB 前端包，镜像抖动时能挂十几分钟。
+    # 默认**不跑**，需要时显式打开 —— 否则"跑一遍冒烟测试"会变成"等网络"。
+    if os.environ.get("MP_SMOKE_NET") == "1":
+        scenario_e()
+        scenario_f()
+    else:
+        print("\n=== 场景 E / F：跳过真实网络用例（设 MP_SMOKE_NET=1 开启）===")
     scenario_g()
     scenario_dl()
     scenario_h()
