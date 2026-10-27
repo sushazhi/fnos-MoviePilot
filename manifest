@@ -1,5 +1,5 @@
 appname               = moviepilot
-version               = 3.1.8
+version               = 3.2.1
 display_name          = MoviePilot
 desc                  = <b>NAS 媒体库自动化管理工具</b>，支持订阅、搜索、下载、媒体整理与刮削、媒体库刷新及消息通知等核心自动化流程。<br><br>🎬 <b>原生应用：</b>内置 Python 后端与 Web 前端，前后端运行于本地，通过 fnOS 统一网关嵌入桌面访问。
 
@@ -31,4 +31,4 @@ desktop_applaunchname = moviepilot.Application
 install_dep_apps      = nodejs_v24
 
 # 更新日志
-changelog             = v3.1.8<br>1.上游 MoviePilot v3.1.8 更新内容——优化 Emby、Jellyfin、Plex、Navidrome 查询，按首页展示、媒体查重、入库同步等场景获取所需信息，减少不必要的查询与解析开销；修复自动整理音乐时未同步本地封面的问题，按本地音乐封面设置随音乐文件同步封面；修复 TXT、LRC、Lyricsfile 等歌词文件的权限，遵循部署的 UMASK 设置，避免不同用户运行的媒体服务器无法读取歌词<br>2.上游源码零改动原样集成，仅做 fnOS 打包适配（生命周期脚本、统一网关、桌面入口）<br>3.自带 CPython 3.14.8 运行时与全部依赖，安装时无需联网<br>4.本条目由 GitHub Actions 定时检查上游后自动生成
+changelog             = v3.2.1<br>1.上游 MoviePilot v3.2.1 更新内容——优化媒体卡片与详情页加载：合并入库、订阅状态查询，共享配置读取，减少重复请求；推荐轮询避免请求重叠，并在后台暂停；优化日历、站点和资源列表加载：优先查询可见日期，限制单次加载规模，完善旧版本兼容与失败重试；完善外观与交互体验：新增玻璃特效开关，修正主题预览、默认外观恢复和多语言显示，优化插件搜索、文件列表与弹窗布局，修复下载器拖拽崩溃<br>2.上游源码零改动原样集成，仅做 fnOS 打包适配（生命周期脚本、统一网关、桌面入口）<br>3.自带 CPython 3.14.8 运行时与全部依赖，安装时无需联网<br>4.本条目由 GitHub Actions 定时检查上游后自动生成
