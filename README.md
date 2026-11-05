@@ -96,11 +96,27 @@ cd /var/apps/moviepilot/target
 ./cmd/main update-check    # 只看有没有新版本，不动任何文件
 ./cmd/main resources       # 立即同步站点资源（认证扩展 + 站点索引）
 ./cmd/main rollback        # 回滚到更新前的版本（备份在 <应用目录>/.mp-backup/）
-./cmd/main repair          # 修复站点资源（模块错位/缺失导致起不来时，纯本地、无网络）
+./cmd/main repair          # 修复站点资源与插件源码（模块错位/缺失、插件显示「插件文件缺失」时，纯本地、无网络）
 ```
 
-> `repair` 是离线自愈（按当前源码结构重新对位资源文件）；`resources` 是在线升级（比对版本并下载）。启动路径两个都跑：先 `repair` 再 `resources`。
-> 通过 fpk 重新安装/升级应用时，应用目录被整包替换，自更新内容随之回到安装包版本 —— 这是预期行为，也让「装包升级」始终是可靠的回退路径。
+> `repair` 是离线自愈（按当前源码结构重新对位资源文件、把插件源码对位到数据目录）；`resources` 是在线升级（比对版本并下载）。启动路径三个都跑：先 `repair`（资源）再 `resources`，最后 `repair_plugins`。
+> 通过 fpk 重新安装/升级应用时，应用目录被整包替换，自更新内容随之回到安装包版本 —— 这是预期行为，也让「装包升级」始终是可靠的回退路径。**唯一例外是插件源码**，见下节。
+
+### 插件源码不会被装包/自更新丢掉
+
+MoviePilot 把用户插件装在**源码树**里（上游写死 `ROOT_PATH/app/plugins`），而这正是每次升级都会被整体替换的那一半目录：fnOS 应用中心装包换掉整个 `@appcenter/<app>`，应用内自更新（`stage_replace`）换掉整个 `app/`。插件记录留在数据库里，于是插件页永远显示「插件文件缺失」（前端 `sourceMissing` / 后端 `PluginRuntimeStatus.SOURCE_MISSING`，判定条件只是 `app/plugins/<id>` 不是目录）。
+
+上游的插件备份/恢复在原生部署下**一次都不会触发**（`backup_plugins` / `restore_plugins` 要求存在 `/.dockerenv`）。所以本包在启动前把插件源码对位到应用数据目录并做成软链：
+
+```
+${TRIM_PKGVAR}/plugins_src/          # 真实插件源码（不随应用包替换）
+<应用目录>/mp/app/plugins -> 上面的目录
+```
+
+- 由 `app/bin/mp_plugins.py` 实现，`cmd/main start`（以及 `./cmd/main repair`）调用，失败只记日志、不阻塞启动
+- `app/plugins/__init__.py` 是宿主提供的兼容入口（属于源码，内容随版本变化），每次都以包内那份刷新；其余内容一律保留在持久目录
+- 只复制不移动，任何一步失败都保持源码树原样；持久目录已有同名插件时以持久那份为准
+- 插件在运行时安装/更新直接落在持久目录里，装包升级与自更新都不会再丢
 
 ## 从源码构建
 
@@ -142,6 +158,7 @@ python build.py --skip-mp / --skip-fe # 跳过下载后端 / 前端
 python tools/updater_smoke.py     # 自更新器（主程序 + 站点资源 + 下载提速），全离线
 python tools/bump_upstream_smoke.py
 python tools/resources_smoke.py
+python tools/plugins_smoke.py     # 插件源码持久化（软链不受装包/自更新影响）
 python tools/supervisor_smoke.py
 python tools/pkgsize_smoke.py
 python tools/cmd_env_smoke.py     # 需 bash
@@ -152,7 +169,7 @@ python tools/polyfill_smoke.py    # 需 node，缺失则 SKIP
 
 - 产物体积数百 MB（自带解释器 + 全部依赖），这是「安装时零联网」的代价
 - 依赖优先用预编译 wheel（`anitopy`、`pinyin2hanzi` 只有 sdist，不能一刀切 `--no-build`）；wheel 的 manylinux 基线不得高于 glibc 2.36（fnOS / Debian 12）
-- MoviePilot 插件依赖由后端运行时 pip 装进 `app/python/site-packages`，**整包升级后需重新安装插件依赖**
+- MoviePilot 插件依赖由后端运行时 pip 装进 `app/python/site-packages`，**整包升级后需重新安装插件依赖**（插件源码本身已由 `plugins_src` 持久化，不再随升级丢失）
 - 自更新要求应用目录（`TRIM_APPDEST`）可写；只读时跳过更新并记日志，只能靠重新装包升级
 - 自更新不替换 `app/python/` 运行时；新版引入新依赖时由更新器 pip 增量补装（需联网，走国内镜像）
 - 站点资源同步只替换认证扩展与站点索引两个文件，不动 `site-packages`

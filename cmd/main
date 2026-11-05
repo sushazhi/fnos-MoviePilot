@@ -75,6 +75,7 @@ SUPER_STDIO_LOG="${MP_TMP}/${APP_NAME}-supervisor-stdio.log"
 GATEWAY_SOCK="${TRIM_APPDEST}/${APP_NAME}.sock"
 MP_UPDATER="${BIN_DIR}/mp_updater.py"
 MP_RESOURCES="${BIN_DIR}/mp_resources.py"
+MP_PLUGINS="${BIN_DIR}/mp_plugins.py"
 UPDATE_LOG="${TRIM_PKGVAR}/update.log"
 # 更新器 stdout/stderr 的落点。**不要**直接写 UPDATE_LOG：mp_updater.py 自己会写
 # 那个文件（MP_UPDATE_LOG），两边都写会让每一行重复两遍（实测）。这里改写到临时
@@ -219,6 +220,27 @@ repair_resources() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# 插件源码自愈：用户插件装在源码树的 app/plugins 下（上游写死 ROOT_PATH/app/plugins），
+# 而这一半目录正是每次"整包装升级 / 应用内自更新"都会被整体换掉的地方；插件记录却
+# 留在数据库里 —— 于是插件页永远显示「插件文件缺失」（sourceMissing）。
+# 上游的插件备份/恢复只在容器里生效（要求 /.dockerenv），原生版一次都不会触发。
+# 这里把插件源码对位到应用数据目录并做成软链，纯文件操作、幂等、失败不阻塞启动。
+# ---------------------------------------------------------------------------
+repair_plugins() {
+    [ -f "$MP_PLUGINS" ] || return 0
+    [ -x "$APP_PYTHON" ] || return 0
+    export MP_SRC CONFIG_DIR
+    local rc=0
+    "$APP_PYTHON" "$MP_PLUGINS" >> "$UPDATE_LOG" 2>&1 || rc=$?
+    case "$rc" in
+        0) log "==> 插件源码目录检查通过" ;;
+        1) log "==> 警告：插件源码未持久化（详见 ${UPDATE_LOG}），装包/更新后插件会显示缺失" ;;
+        *) log "==> 插件源码目录检查未完成（rc=$rc），继续启动" ;;
+    esac
+    return 0
+}
+
 start_app() {
     if is_running; then
         return 0
@@ -328,6 +350,9 @@ start)
     if [ "${MP_SKIP_UPDATE:-}" != "1" ]; then
         run_updater --resources --auto || true
     fi
+    # 以上任何一步换掉 app/ 都会连带清空 app/plugins（插件源码），这里在启动前
+    # 统一对位一次：插件源码落到数据目录，源码树用软链指过去。
+    repair_plugins
     start_app || exit 1
     log "=== started ==="
     exit 0
@@ -375,9 +400,10 @@ resources)
     exit 0
     ;;
 repair)
-    # 手动修复站点资源（sites 扩展错位/缺失导致后端起不来时）
-    log "=== 修复站点资源 ==="
+    # 手动修复站点资源与插件源码（sites 扩展错位/缺失、插件显示「插件文件缺失」时）
+    log "=== 修复站点资源与插件源码 ==="
     repair_resources
+    repair_plugins
     tail -n 30 "$UPDATE_LOG" > "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
     exit 0
     ;;
