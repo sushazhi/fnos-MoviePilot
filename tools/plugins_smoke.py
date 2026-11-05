@@ -31,6 +31,7 @@
   Q 建链窗口的并发写入：不覆盖、不丢弃，改为合并后放弃本次链接
   R 同名冲突且源码树那份更新：必须用更新的那份（不静默回退），旧副本归档保留
   S 插件目录里的断链条目：照样算「有对应副本」，不留残骸在源码树里
+  T 接线守卫：start 路径调用顺序、退出码日志、supervisor 自愈、卸载清理（静态断言）
 """
 import os
 import shutil
@@ -564,6 +565,27 @@ else:
           (persist18 / "ghostplugin").is_symlink())
     check("S3 旧目录没有留下残骸（不留到下次装包被整个换掉）",
           leftovers(mp_src18 / "app") == [])
+
+print("== T. 接线守卫（静态断言，防止有人把调用点删掉/挪错位置） ==")
+main_sh = (ROOT / "cmd" / "main").read_text(encoding="utf-8")
+sup_py = (ROOT / "app" / "bin" / "supervisor.py").read_text(encoding="utf-8")
+uni_sh = (ROOT / "cmd" / "uninstall_callback").read_text(encoding="utf-8")
+# 启动路径必须在 start_app 之前调用 repair_plugins（更新器已把 app/ 换掉）。
+# 按 case 标签切出 start 分支，再用**启动器那一行**定位，避免被注释里的同名文字骗过。
+start_case = main_sh.split("\nstart)", 1)[-1].split("\nupdate)", 1)[0]
+launcher = "start_app || exit 1"
+check("T1 cmd/main 的 start 路径在启动前调用了 repair_plugins",
+      "repair_plugins" in start_case and launcher in start_case
+      and start_case.index("repair_plugins") < start_case.rindex(launcher),
+      f"len={len(start_case)} has_repair={'repair_plugins' in start_case} has_launcher={launcher in start_case}")
+check("T2 cmd/main 为退出码 3 与 1 都给了可见日志",
+      "插件源码目录需人工介入" in main_sh and "插件源码未持久化" in main_sh)
+check("T3 start 顶部有 is_running 早退（冗余 start 不再动文件）",
+      "已在运行，跳过本次启动流程" in main_sh)
+check("T4 supervisor 的启动自愈也兜插件目录",
+      "mp_plugins.py" in sup_py and "_run_repair_script" in sup_py)
+check("T5 卸载删数据时一并清插件源码目录",
+      "${TRIM_PKGVAR}/plugins_src" in uni_sh)
 
 print()
 if SKIPS:
