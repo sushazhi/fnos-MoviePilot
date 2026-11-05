@@ -236,6 +236,7 @@ repair_plugins() {
     case "$rc" in
         0) log "==> 插件源码目录检查通过" ;;
         1) log "==> 警告：插件源码未持久化（详见 ${UPDATE_LOG}），装包/更新后插件会显示缺失" ;;
+        3) log "==> 警告：插件源码目录需人工介入（详见 ${UPDATE_LOG}，如插件需在插件页重装）" ;;
         *) log "==> 插件源码目录检查未完成（rc=$rc），继续启动" ;;
     esac
     return 0
@@ -326,6 +327,13 @@ rotate_logs
 case "${1:-}" in
 start)
     log "=== start ==="
+    # 已在运行就直接返回。下面这些步骤会替换整个 app/（更新器）并对 app/plugins 做
+    # 改名 + 建链；原先 is_running 只挡在 start_app 里，等于每次冗余 start 都要先动
+    # 一遍文件系统 —— 正在服务的插件目录会被挪走，正好撞上并发写插件的进程。
+    if is_running; then
+        log "已在运行，跳过本次启动流程"
+        exit 0
+    fi
     # 密钥兜底：app.env 是 SECRET_KEY / RESOURCE_SECRET_KEY 的唯一来源，缺了后端会
     # 退化成"每次启动随机生成"，后果是登录态与站点索引（以及只认资源 Cookie 的
     # EventSource 接口）全部作废。install / upgrade / config 三条路径都会补，但
@@ -401,10 +409,21 @@ resources)
     ;;
 repair)
     # 手动修复站点资源与插件源码（sites 扩展错位/缺失、插件显示「插件文件缺失」时）
+    # 与 resources/update/rollback 一致：先停应用再动文件。插件修复会在改名与建链
+    # 之间留下一个没有 app/plugins 的窗口，跑着的后端正是通过这个路径读写插件的。
     log "=== 修复站点资源与插件源码 ==="
+    was_running=0
+    if is_running; then
+        was_running=1
+        "$0" stop
+        sleep 2
+    fi
     repair_resources
     repair_plugins
     tail -n 30 "$UPDATE_LOG" > "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+    if [ "$was_running" = "1" ]; then
+        "$0" start
+    fi
     exit 0
     ;;
 rollback)

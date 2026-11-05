@@ -113,10 +113,12 @@ ${TRIM_PKGVAR}/plugins_src/          # 真实插件源码（不随应用包替�
 <应用目录>/mp/app/plugins -> 上面的目录
 ```
 
-- 由 `app/bin/mp_plugins.py` 实现，`cmd/main start`（以及 `./cmd/main repair`）调用，失败只记日志、不阻塞启动
-- `app/plugins/__init__.py` 是宿主提供的兼容入口（属于源码，内容随版本变化），每次都以包内那份刷新；其余内容一律保留在持久目录
-- 只复制不移动，任何一步失败都保持源码树原样；持久目录已有同名插件时以持久那份为准
-- 插件在运行时安装/更新直接落在持久目录里，装包升级与自更新都不会再丢
+- 由 `app/bin/mp_plugins.py` 实现；`cmd/main start`（以及 `./cmd/main repair`）调用，失败只记日志、不阻塞启动。后端"起不来就自愈"的那条路（`supervisor.py` 的 `repair_backend_resources`）也会兜一次，避免插件目录问题把启动打进"启动→秒退→重启"的循环
+- 每个插件**原子落位**：先复制到持久目录里的临时名再 `os.replace`，失败不留"半个插件"（半份副本会被后续运行当成完整副本，而源码树那份已经换成软链 —— 那等于永久损坏）；链接失败时把本次刚复制进去的条目撤掉，源码树保持原样
+- `app/plugins/__init__.py` 只是命名空间标记（上游运行时自己会重写它），缺失不影响导入；源码树里有那份时以包内为准，写入同样原子（写坏会变成 SyntaxError）
+- root 下（安装/升级/配置回调会以 root 调 `cmd/main restart`）创建或迁移的插件文件会 `chown` 回应用运行用户（`TRIM_USERNAME`，缺省 `moviepilot`）—— 否则应用写不进插件目录，插件安装直接 PermissionError
+- 软链目标被删（断链）时把 `app/plugins` 恢复成真实目录并报 3：应用能起来，插件需在插件页重装
+- 卸载时若选择删除数据，`plugins_src` 会与 `config/` 一起清掉（插件源码里带着插件自己的数据）
 
 ## 从源码构建
 

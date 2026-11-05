@@ -304,40 +304,61 @@ def _watch_backend_ready(proc):
     log("警告：后端启动超过 900s 仍未监听 %s:%s" % (BACKEND_HOST, port))
 
 
-def repair_backend_resources():
-    """回填站点资源（app/application/site/sites.*）。
+def _run_repair_script(script_name, tag, extra_env=None, timeout=180):
+    """跑一个 app/bin 下的自愈脚本，日志加 tag 前缀；失败不抛，返回退出码或 None。
 
-    后端 import 阶段就依赖 sites 扩展，缺了必然起不来。资源随上游重构搬过家
-    （app/helper → app/application/site），且自更新器替换整个 mp/ 时可能把它
-    漏掉，所以在**每次启动后端起不来时**都要兜一次，而不只是在 cmd/main start
-    阶段做一次。
-
-    幂等、纯标准库、失败不抛（修复不了就继续尝试启动，由日志暴露问题）。
+    后端起不来时的自愈必须能覆盖"整个 app/ 被替换"带来的所有后果，所以这里做成
+    可复用的形式，而不是把两段几乎一样的 subprocess 抄两遍。
     """
-    script = os.path.join(BIN_DIR, "mp_resources.py")
+    script = os.path.join(BIN_DIR, script_name)
     python = os.path.join(VENV_DIR, "bin", "python")
     if not (os.path.isfile(script) and os.path.isfile(python) and MP_SRC):
-        return
+        return None
+    env = {**os.environ, "MP_SRC": MP_SRC, "APP_PYTHON": python}
+    if extra_env:
+        env.update({k: v for k, v in extra_env.items() if v})
     try:
         proc = subprocess.run(
             [python, script],
-            env={**os.environ, "MP_SRC": MP_SRC, "APP_PYTHON": python},
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=180,
+            timeout=timeout,
         )
-        out = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
-        if out:
-            for line in out.splitlines():
-                log("  [resources] " + line)
-        if proc.returncode == 0:
-            log("站点资源检查通过，重启后端")
-        else:
-            log("站点资源修复未完成（退出码 %s），仍尝试重启后端" % proc.returncode)
     except subprocess.TimeoutExpired:
-        log("站点资源修复超时（120s），继续重启后端")
+        log("%s 修复超时（%ds），继续重启后端" % (tag, timeout))
+        return None
     except Exception as e:
-        log("站点资源修复异常（忽略）: %s" % e)
+        log("%s 修复异常（忽略）: %s" % (tag, e))
+        return None
+    out = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
+    if out:
+        for line in out.splitlines():
+            log("  [%s] %s" % (tag, line))
+    return proc.returncode
+
+
+def repair_backend_resources():
+    """回填站点资源（app/application/site/sites.*）与插件源码目录。
+
+    后端 import 阶段就依赖 sites 扩展，缺了必然起不来；`app/plugins` 断链或整个
+    消失同样会让 `import app.plugins` 直接失败，而它在装包/自更新替换整个 `app/`
+    时正是最先遭殃的那个目录。两者都可能在替换后出问题，所以在**每次启动后端起
+    不来时**都要兜一次，而不只是在 cmd/main start 阶段做一次。
+
+    幂等、纯标准库、失败不抛（修复不了就继续尝试启动，由日志暴露问题）。
+    """
+    rc = _run_repair_script("mp_resources.py", "resources")
+    if rc == 0:
+        log("站点资源检查通过，重启后端")
+    elif rc is not None:
+        log("站点资源修复未完成（退出码 %s），仍尝试重启后端" % rc)
+
+    rc = _run_repair_script("mp_plugins.py", "plugins", {"CONFIG_DIR": CONFIG_DIR})
+    if rc == 0:
+        log("插件源码目录检查通过")
+    elif rc is not None:
+        log("插件源码目录未就绪（退出码 %s），仍尝试重启后端" % rc)
 
 
 def _cleanup_stale_backend():

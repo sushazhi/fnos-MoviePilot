@@ -6,8 +6,11 @@ set -u
 APP_NAME="moviepilot"
 
 if [ "${wizard_data_action:-keep}" = "delete" ]; then
-    # 删除数据目录（配置、数据库、venv、browsers 浏览器缓存、日志）
+    # 删除数据目录（配置、数据库、venv、browsers 浏览器缓存、日志、插件源码）
+    # plugins_src 必须一起删：插件源码里带着插件自己的数据（如 autosignin/sites/），
+    # 只清 config 会留下"看起来已删干净、重装后又冒出来"的插件目录。
     rm -rf "${TRIM_PKGVAR}/config" "${TRIM_PKGVAR}/venv" "${TRIM_PKGVAR}/browsers" \
+           "${TRIM_PKGVAR}/plugins_src" \
            "${TRIM_PKGVAR}/${APP_NAME}.log" \
            "${TRIM_PKGVAR}/install.log" "${TRIM_PKGVAR}/config.log" "${TRIM_PKGVAR}/upgrade.log"
     # 删除共享目录中的备份（共享路径未导出时备份位于包数据目录，一并兜底）
