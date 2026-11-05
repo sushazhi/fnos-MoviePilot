@@ -310,11 +310,30 @@ def _refresh_shim(plugins_dir: Path, persist: Path) -> bool:
     return (persist / SHIM_NAME).is_file()
 
 
-def _migrate(plugins_dir: Path, persist: Path) -> Tuple[List[Path], List[str]]:
-    """把源码树里的真实插件复制进持久目录，返回 (本次新建的目标, 跳过的名字)。
+def _newest_mtime(path: Path) -> float:
+    """返回目录树里最新的修改时间（忽略构建产物），非目录则返回自身 mtime。"""
+    try:
+        if not path.is_dir():
+            return path.stat().st_mtime
+        newest = path.stat().st_mtime
+        for item in path.rglob("*"):
+            if item.name == "__pycache__" or item.suffix == ".pyc":
+                continue
+            try:
+                newest = max(newest, item.stat().st_mtime)
+            except OSError:
+                continue
+        return newest
+    except OSError:
+        return 0.0
 
-    跳过判据是"目标已存在（含软链）"：落位用 `os.replace` 原子完成，所以已存在的
-    目标一定是完整副本，可以直接以它为准。
+
+def _migrate(plugins_dir: Path, persist: Path) -> Tuple[List[Path], List[str]]:
+    """把源码树里的真实插件复制进持久目录，返回 (本次新建的目标, 保留持久那份的名字)。
+
+    同名冲突的处理：默认以持久那份为准（它才是上次真正跑起来的那份）；但若源码树里
+    那份**更新**（链接失败的那段时间里应用仍在源码树里装/更新插件），就改用源码树
+    这份，并把旧的归档成 `.leftover-*` —— 否则插件会被悄悄回退到旧版本。
     """
     created: List[Path] = []
     skipped: List[str] = []
@@ -323,7 +342,21 @@ def _migrate(plugins_dir: Path, persist: Path) -> Tuple[List[Path], List[str]]:
             continue
         target = persist / item.name
         if target.exists() or target.is_symlink():
-            skipped.append(item.name)
+            if _newest_mtime(item) > _newest_mtime(target) + 1:
+                archive = persist / f"{LEFTOVER_PREFIX}{item.name}"
+                try:
+                    _remove(archive)
+                    os.replace(str(target), str(archive))
+                    _copy_entry(item, target)
+                except OSError as e:
+                    log(f"  警告: 源码树里的 {item.name} 更新但替换失败，保留持久那份: {e}")
+                    skipped.append(item.name)
+                    continue
+                log(f"  {item.name} 源码树那份更新，改用源码树这份（旧副本归档为 {archive.name}）")
+                # 不记入 created：这不是"凭空新建"，回滚它只会让持久目录少一份与源码树
+                # 同内容的副本；保留下来下一次修复仍以它为准确认"已有对应副本"。
+            else:
+                skipped.append(item.name)
             continue
         _copy_entry(item, target)
         log(f"  迁移插件源码 {item.name}")

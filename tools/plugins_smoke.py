@@ -28,6 +28,9 @@
   N 缺兼容入口只是警告（命名空间包可导入）-> 退出码 0
   O 兼容入口写入原子性：中途失败不得留下写坏的 __init__.py（会变 SyntaxError）
   P 属主（仅 Linux + root）：root 下必须把持久目录 chown 回应用运行用户
+  Q 建链窗口的并发写入：不覆盖、不丢弃，改为合并后放弃本次链接
+  R 同名冲突且源码树那份更新：必须用更新的那份（不静默回退），旧副本归档保留
+  S 插件目录里的断链条目：照样算「有对应副本」，不留残骸在源码树里
 """
 import os
 import shutil
@@ -522,6 +525,45 @@ else:
           (plugins_dir16 / "autosignin" / "__init__.py").is_file()
           and (plugins_dir16 / "__init__.py").is_file())
     check("Q4 源码树没有变成软链", not plugins_dir16.is_symlink())
+
+print("== R. 同名冲突里「源码树更新」的那一份必须赢（不静默回退） ==")
+if not LINKS:
+    skip("R", "需要软链")
+else:
+    base17, mp_src17, plugins_dir17, persist17 = make_tree("newer")
+    add_shim(plugins_dir17)
+    add_plugin(plugins_dir17, "autosignin", "class Plugin:\n    version = 'NEWER'\n")
+    plugins.repair(mp_src17, persist17)
+    # 模拟"链接失败的那段时间里应用仍在源码树里更新插件"：树变回真实目录、内容更新
+    plugins_dir17.unlink()
+    plugins_dir17.mkdir()
+    add_shim(plugins_dir17)
+    import time as _time
+    _time.sleep(1.2)                      # 让 mtime 明确跨过 1s 判定门槛
+    add_plugin(plugins_dir17, "autosignin", "class Plugin:\n    version = 'NEWEST'\n")
+    rc = plugins.repair(mp_src17, persist17)
+    check("R1 修复成功", rc == 0, f"rc={rc}")
+    check("R2 持久目录用上了源码树里更新的那份（不静默回退）",
+          "NEWEST" in (persist17 / "autosignin" / "__init__.py").read_text(encoding="utf-8"),
+          (persist17 / "autosignin" / "__init__.py").read_text(encoding="utf-8")[:60])
+    check("R3 旧副本被归档而不是丢掉",
+          any(p.name.startswith(".leftover-autosignin") for p in persist17.iterdir()),
+          str([p.name for p in persist17.iterdir()]))
+
+print("== S. 插件目录里的断链条目：照样算「有对应副本」，不留残骸 ==")
+if not LINKS:
+    skip("S", "需要软链")
+else:
+    base18, mp_src18, plugins_dir18, persist18 = make_tree("ghost")
+    add_shim(plugins_dir18)
+    add_plugin(plugins_dir18, "autosignin")
+    os.symlink(str(base18 / "missing-target"), str(plugins_dir18 / "ghostplugin"))
+    rc = plugins.repair(mp_src18, persist18)
+    check("S1 修复成功", rc == 0, f"rc={rc}")
+    check("S2 断链条目被一并搬进持久目录",
+          (persist18 / "ghostplugin").is_symlink())
+    check("S3 旧目录没有留下残骸（不留到下次装包被整个换掉）",
+          leftovers(mp_src18 / "app") == [])
 
 print()
 if SKIPS:
