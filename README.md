@@ -80,6 +80,7 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 | `MP_UPDATE_INTERVAL` | `21600` | 检查间隔（秒）；站点资源共用此间隔，各记各的时间戳 |
 | `MP_UPDATE_DEPS` | `1` | 是否同步 Python 依赖；关闭且新版有新增依赖时会**拒绝更新** |
 | `MP_AUTO_UPDATE_RESOURCE` | `1` | 是否同步站点资源 |
+| `MP_GATEWAY_AUTOLOGIN` | `0` | 网关免登录：凭飞牛登录态直接进 MoviePilot，跳过 MP 登录页（见下节，**会放大权限**） |
 | `GITHUB_PROXY` | `https://gh-proxy.com/` | 加速前缀，只作用于 `github.com` 系 URL；`api.github.com` 一律直连 |
 | `GITHUB_PROXY_MIRRORS` | `https://v4.gh-proxy.org/,https://ghfast.top/,https://ghproxy.imciel.com/` | 额外加速前缀，逗号分隔，如 `https://a/,https://b/` |
 
@@ -87,6 +88,35 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 > fnos-qbittorrent：`gh-proxy.com` → `v4.gh-proxy.org` → `ghfast.top` → `ghproxy.imciel.com`
 > （与 `build.py` 的 `PROXIES` 逐项一致，H21b 钉住）。`v4.gh-proxy.org` 必须带 `v4.` 前缀。
 > 镜像均为第三方服务，介意供应链风险可换成自建或可信镜像。
+
+### 网关免登录（`MP_GATEWAY_AUTOLOGIN`，默认关闭）
+
+飞牛网关已经校验过 NAS 登录态，但 MoviePilot 自己的登录态存在浏览器里，所以点开应用
+仍要再登一次。打开这个开关后，**代理代你登录一次**，点开就是仪表盘。
+
+- **怎么做的**：`gateway-proxy.py` 用 `app.env` 的 `SUPERUSER` / `SUPERUSER_PASSWORD`
+  调一次 `/api/v1/login/access-token`，把结果经 `/app/moviepilot/__mp/autologin.json`
+  交给页面头部注入的小脚本，由脚本写进 `localStorage` 的 `auth` / `user` 两个 store
+  （pinia 持久化键）。MoviePilot 自身的鉴权、权限、资源 Cookie 全部保持原样，**没有改一行上游代码**，
+  也不会被应用内自更新覆盖（自更新只换 `mp/` 与 `frontend/`）。
+- **资源 Cookie 必须一起转发**：`system/message`、`system/logging` 这类 EventSource
+  接口只认登录时下发的资源令牌 Cookie，不认 Bearer 头。少了它，界面能进但实时消息、
+  系统日志会一直空着。
+- **令牌会自动续期**：到期前 10 分钟重新登录；代理启动时预热，避免"刚开机第一次打开
+  仍是登录页"。
+- **失败一律降级**：密码被改过、开了二次验证、被登录限流时，端点返回
+  `available=false`，页面就是普通登录页 —— 绝不白屏，也不会把密码或后端错误细节
+  吐给页面。失败后进入退避（401 → 60 秒，429 → 300 秒），不会把账号打进登录限流。
+
+> ⚠️ **安全边界**：开启后，任何能打开本应用（即已通过飞牛网关登录）的人都会拿到
+> **MoviePilot 超级管理员**身份。多用户 NAS、或把飞牛面板暴露到公网时请保持关闭。
+> 在 MoviePilot 界面里改过密码后，`app.env` 的 `SUPERUSER_PASSWORD` 也要同步修改，
+> 否则免登录会自动降级回登录页（日志里会写明代登录失败）。
+>
+> 排障：`app.log` 里搜「网关免登录」。三种落点——已启用 / 开关打开但缺凭据 /
+> 未启用；代登录失败会打印状态码与重试间隔，但不打印密码。
+> 临时联调可用环境变量覆盖 `app.env` 里的值（优先级更高，重启即失效）：
+> `MP_GATEWAY_AUTOLOGIN`、`MP_GATEWAY_AUTOLOGIN_USER`、`MP_GATEWAY_AUTOLOGIN_PASSWORD`。
 
 ### 手动操作与回退
 
@@ -165,6 +195,7 @@ python tools/supervisor_smoke.py
 python tools/pkgsize_smoke.py
 python tools/cmd_env_smoke.py     # 需 bash
 python tools/polyfill_smoke.py    # 需 node，缺失则 SKIP
+python tools/autologin_smoke.py   # 网关免登录（开关/端点/续期/失败降级），需 node 做语法校验
 ```
 
 ## 已知限制

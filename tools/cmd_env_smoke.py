@@ -82,6 +82,10 @@ expect_eq "A7 向导密码写入" "Adm1n@2026" "$(key_value "${ENV_A}" SUPERUSER
 # A8：全新安装的模板里必须带上站点资源同步开关（默认开启）
 expect_eq "A8 模板含站点资源同步开关" "1" \
     "$(key_value "${ENV_A}" MP_AUTO_UPDATE_RESOURCE)"
+# A9：网关免登录默认必须关闭 —— 打开它等于把超管身份发给所有能访问应用的人，
+# 只能由用户显式选择。模板里缺这个键时代理按关闭处理，但界面上就再也开不了。
+expect_eq "A9 模板含网关免登关键且默认关闭" "0" \
+    "$(key_value "${ENV_A}" MP_GATEWAY_AUTOLOGIN)"
 
 echo "--- B 覆盖安装：保留密钥与用户配置 ---"
 ENV_B="${WORK}/b.env"
@@ -112,17 +116,39 @@ expect_eq "B8 缺失键补默认值" "1" "$(key_value "${ENV_B}" MP_AUTO_UPDATE)
 # 默认 1 —— 关掉它站点资源就永远不更新，只能是用户显式选择的结果。
 expect_eq "B9 站点资源同步开关补默认值" "1" \
     "$(key_value "${ENV_B}" MP_AUTO_UPDATE_RESOURCE)"
+# B10：网关免登录同样要补齐，但默认 **0**：老 app.env 没这个键时代理按关闭走，
+# 补 0 只是让面板上的开关有确定的初值；补 1 就等于替用户打开了超管直通。
+expect_eq "B10 网关免登关键补默认值（关闭）" "0" \
+    "$(key_value "${ENV_B}" MP_GATEWAY_AUTOLOGIN)"
+# B11：用户已经打开这个开关后，**再一次覆盖安装不能把它拉回 0**。
+# 覆盖安装只允许 ensure（补缺失键），任何"顺手写回默认值"都会让用户的面板设置
+# 每次重装都失效 —— 与 B2/B6 是同一个不变式，只是键不同。
+mp_env_upsert "${ENV_B}" "MP_GATEWAY_AUTOLOGIN" "1"
+mp_env_bootstrap "${ENV_B}" "/vol1/@appdata/moviepilot/config" >/dev/null
+expect_eq "B11 覆盖安装保留用户已开的值" "1" \
+    "$(key_value "${ENV_B}" MP_GATEWAY_AUTOLOGIN)"
+expect_eq "B12 覆盖安装不产生重复键" "1" \
+    "$(key_count "${ENV_B}" MP_GATEWAY_AUTOLOGIN)"
 
 echo "--- C 覆盖安装 + 向导显式值 ---"
 export wizard_port=3999
 export wizard_superuser_password='A&b|c/d'
+export wizard_gateway_autologin=1
 out="$(mp_env_bootstrap "${ENV_B}" "/vol1/@appdata/moviepilot/config")"
 expect_eq "C1 向导端口覆盖生效" "3999" "$(key_value "${ENV_B}" PORT)"
 expect_eq "C2 含 & | / 的值按原样写入（不走 sed 拼接）" 'A&b|c/d' \
     "$(key_value "${ENV_B}" SUPERUSER_PASSWORD)"
+# C5：向导显式选"开启"才写入 1 —— 这是这个开关唯一的打开路径。
+expect_eq "C5 向导选择开启后写入 1" "1" \
+    "$(key_value "${ENV_B}" MP_GATEWAY_AUTOLOGIN)"
+export wizard_gateway_autologin=bogus
+out="$(mp_env_bootstrap "${ENV_B}" "/vol1/@appdata/moviepilot/config")"
+# C6：脏值一律落 0（安全侧），不能因为解析出意外字符就把超管直通打开。
+expect_eq "C6 向导脏值归一化为关闭" "0" \
+    "$(key_value "${ENV_B}" MP_GATEWAY_AUTOLOGIN)"
 expect_eq "C3 多次引导密钥仍不变" "OLDsecret==" "$(key_value "${ENV_B}" SECRET_KEY)"
 expect_eq "C4 键不重复写入" "1" "$(key_count "${ENV_B}" SUPERUSER_PASSWORD)"
-unset wizard_port wizard_superuser_password
+unset wizard_port wizard_superuser_password wizard_gateway_autologin
 
 echo "--- D mp_env_ensure / mp_env_ensure_secret ---"
 ENV_D="${WORK}/d.env"
@@ -279,6 +305,33 @@ def contract_checks() -> None:
     # 非 0/1 一律按开启处理：与 MP_AUTO_UPDATE 同口径，避免把能自愈的资源同步误关。
     check("L. config_callback 对非预期开关值按开启兜底",
           '*)   MP_AUTO_UPDATE_RESOURCE_VALUE="1" ;;' in config_cb)
+    # L2. 网关免登录开关：与上面同口径，安装模板、覆盖安装、改配置三处都要有默认值，
+    #     否则老包升级上来的 app.env 永远缺这个键（代理读不到 -> 恒为关闭），
+    #     用户在应用设置里开了也不生效。
+    #     安全侧口径与 MP_AUTO_UPDATE 相反：非 0/1 一律落 **0**（关闭），
+    #     因为打开它 = 把超管身份发给所有能访问应用的人。
+    check("L2. lib.sh 全新安装模板含 MP_GATEWAY_AUTOLOGIN",
+          "MP_GATEWAY_AUTOLOGIN=${gateway_autologin}" in lib)
+    check("L2. lib.sh 覆盖安装补齐 MP_GATEWAY_AUTOLOGIN",
+          'mp_env_ensure "${env_file}" "MP_GATEWAY_AUTOLOGIN" "0"' in lib)
+    check("L2. lib.sh 向导值归一化（非 1 一律 0）",
+          'gateway_autologin=0' in lib and '1) gateway_autologin=1 ;;' in lib)
+    check("L2. config_callback 补齐 MP_GATEWAY_AUTOLOGIN",
+          'mp_env_ensure "${ENV_FILE}" "MP_GATEWAY_AUTOLOGIN" "0"' in config_cb)
+    check("L2. config_callback 非预期开关值按关闭兜底",
+          '*) MP_GATEWAY_AUTOLOGIN_VALUE="0" ;;' in config_cb)
+    # L2b. 装包升级路径也必须补：这条路径不经过 lib.sh 的 bootstrap，漏了它
+    #      老用户升级上来 app.env 永远没有这个键（面板上看到开关、实际恒关闭）。
+    upgrade_cb = read(CMD / "upgrade_callback")
+    check("L2b. upgrade_callback 补齐 MP_GATEWAY_AUTOLOGIN（关闭）",
+          'mp_env_ensure "${CONFIG_DIR}/app.env" "MP_GATEWAY_AUTOLOGIN" "0"' in upgrade_cb)
+    # L3. 向导里必须有这个字段，否则用户在安装/改配置时根本看不到开关。
+    wizard = read(ROOT / "wizard" / "config")
+    check("L3. wizard/config 含 wizard_gateway_autologin 字段",
+          "wizard_gateway_autologin" in wizard)
+    check("L3. wizard 该字段默认关闭",
+          '"field": "wizard_gateway_autologin"' in wizard
+          and '"initValue": "0"' in wizard.split("wizard_gateway_autologin")[1][:400])
     # M. 重启路径必须真的调用资源同步，否则"重启即同步"只是文档里的一句话。
     check("M. cmd/main 启动路径调用 --resources 同步",
           "--resources" in main and "run_updater --resources --auto" in main)

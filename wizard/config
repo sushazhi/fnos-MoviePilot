@@ -37,6 +37,16 @@
           { "label": "开启（推荐）", "value": "1" },
           { "label": "关闭", "value": "0" }
         ]
+      },
+      {
+        "type": "select",
+        "field": "wizard_gateway_autologin",
+        "label": "网关免登录（凭飞牛登录态直接进入 MoviePilot，跳过 MP 登录页；任何能打开本应用的 NAS 用户都将获得超管权限，多用户环境请勿开启）",
+        "initValue": "0",
+        "options": [
+          { "label": "关闭（默认，最安全）", "value": "0" },
+          { "label": "开启", "value": "1" }
+        ]
       }
     ]
   },

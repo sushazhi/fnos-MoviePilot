@@ -253,10 +253,19 @@ mp_env_bootstrap() {
         mp_env_ensure "${env_file}" "MP_UPDATE_DEPS" "1"
         # 站点资源（认证扩展 + 站点索引）是独立发布通道，默认同样跟着重启同步。
         mp_env_ensure "${env_file}" "MP_AUTO_UPDATE_RESOURCE" "1"
+        # 网关免登录是新增能力，默认关闭：老 app.env 里没有这个键，代理读不到就
+        # 按关闭处理（行为与升级前完全一致）。只补缺失键，不覆盖用户已开的值。
+        mp_env_ensure "${env_file}" "MP_GATEWAY_AUTOLOGIN" "0"
         # 只有向导里真的填了才覆盖：留空表示"沿用原有配置"，
         # 早期实现会把留空的管理员密码直接写成空值（等于清掉配置）。
         if [ -n "${wizard_port:-}" ]; then
             mp_env_upsert "${env_file}" "PORT" "${wizard_port}"
+        fi
+        if [ -n "${wizard_gateway_autologin:-}" ]; then
+            case "${wizard_gateway_autologin}" in
+                1) mp_env_upsert "${env_file}" "MP_GATEWAY_AUTOLOGIN" "1" ;;
+                *) mp_env_upsert "${env_file}" "MP_GATEWAY_AUTOLOGIN" "0" ;;
+            esac
         fi
         if [ -n "${wizard_nginx_port:-}" ]; then
             mp_env_upsert "${env_file}" "NGINX_PORT" "${wizard_nginx_port}"
@@ -277,6 +286,12 @@ mp_env_bootstrap() {
     local secret resource_secret
     secret="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
     resource_secret="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+    # 向导值归一化：非 0/1 一律落成 0（安全侧），避免把脏值写进代理的开关解析。
+    local gateway_autologin
+    case "${wizard_gateway_autologin:-0}" in
+        1) gateway_autologin=1 ;;
+        *) gateway_autologin=0 ;;
+    esac
     cat > "${env_file}" <<EOF
 # MoviePilot fnOS 环境配置
 CONFIG_DIR=${config_dir}
@@ -308,6 +323,12 @@ MP_UPDATE_DEPS=1
 # jxxghp/MoviePilot-Resources 独立发布，与主程序版本无关；开启后每次启动前
 # 一并检查。索引与扩展必须成对替换，失败会自动回滚且不影响启动。
 MP_AUTO_UPDATE_RESOURCE=1
+# 网关免登录（可选，默认关闭）：网关代理由 app.env 的 SUPERUSER / SUPERUSER_PASSWORD
+# 代登录一次，点开应用直接进 MoviePilot，不再显示登录页。
+# 注意：开启后任何能打开本应用（即已通过飞牛网关登录）的人都会拿到超管权限，
+# 多用户 NAS 或把飞牛面板暴露到公网时请保持关闭；在 MoviePilot 界面里改过密码后，
+# 这里的 SUPERUSER_PASSWORD 也要同步修改，否则免登录会自动降级回登录页。
+MP_GATEWAY_AUTOLOGIN=${gateway_autologin}
 EOF
     echo "fresh"
     return 0

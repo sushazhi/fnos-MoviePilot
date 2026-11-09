@@ -76,12 +76,22 @@ if [ -n "${wizard_auto_update_resource:-}" ]; then
     esac
     mp_env_upsert "${ENV_FILE}" "MP_AUTO_UPDATE_RESOURCE" "${MP_AUTO_UPDATE_RESOURCE_VALUE}"
 fi
+# 网关免登录开关（向导 select：1=开启 / 0=关闭）。默认关闭：本能力会让"能打开
+# 应用的人"直接获得超管身份，只有显式选择才生效。非预期值一律落成 0（安全侧）。
+if [ -n "${wizard_gateway_autologin:-}" ]; then
+    case "${wizard_gateway_autologin}" in
+        1) MP_GATEWAY_AUTOLOGIN_VALUE="1" ;;
+        *) MP_GATEWAY_AUTOLOGIN_VALUE="0" ;;
+    esac
+    mp_env_upsert "${ENV_FILE}" "MP_GATEWAY_AUTOLOGIN" "${MP_GATEWAY_AUTOLOGIN_VALUE}"
+fi
 # 补齐其它更新相关默认值（旧版本安装的 app.env 没有这些键）
 mp_env_ensure "${ENV_FILE}" "MP_AUTO_UPDATE" "1"
 mp_env_ensure "${ENV_FILE}" "MP_UPDATE_CHANNEL" "release"
 mp_env_ensure "${ENV_FILE}" "MP_UPDATE_INTERVAL" "21600"
 mp_env_ensure "${ENV_FILE}" "MP_UPDATE_DEPS" "1"
 mp_env_ensure "${ENV_FILE}" "MP_AUTO_UPDATE_RESOURCE" "1"
+mp_env_ensure "${ENV_FILE}" "MP_GATEWAY_AUTOLOGIN" "0"
 
 # 补齐安全密钥（见 lib.sh 的 mp_env_ensure_secret）。缺失会让后端回退到每次
 # 启动随机的默认值：站点索引解不开（"No data available"）、登录态每次重启失效。
