@@ -53,10 +53,13 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
                                                          │ moviepilot.sock
                                                          ▼
                               gateway-proxy.py（剥离前缀 + JS polyfill + WS 隧道）
-                                                         │
-                              Node 前端 frontend-server.js :3005（静态资源 + /api 代理）
+                                                         │ X-MP-Gateway-Prefix
+                              Node 前端 frontend-server.js :3005（静态资源 + /api 代理
+                                                    + 网关免登录注入，两条路径共用）
                                                          │
                               Python 后端 app/main.py :3002
+
+直连前端端口（飞牛 APP / FN Connect 映射到应用端口）──────────▲
 ```
 
 `gateway-proxy.py` 会把 `Authorization` 改名为 `X-MP-Auth` 再发出（fnOS 网关会把该头当成自己的令牌校验，不通过就返回 `200 text/plain "invalid token"`，请求到不了应用），代理转发时再还原。
@@ -92,17 +95,26 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 ### 网关免登录（`MP_GATEWAY_AUTOLOGIN`，默认关闭）
 
 飞牛网关已经校验过 NAS 登录态，但 MoviePilot 自己的登录态存在浏览器里，所以点开应用
-仍要再登一次。打开这个开关后，**代理代你登录一次**，点开就是仪表盘。
+仍要再登一次。打开这个开关后，**前端服务代你登录一次**，点开就是仪表盘。
 
-- **怎么做的**：`gateway-proxy.py` 用 `app.env` 的 `SUPERUSER` / `SUPERUSER_PASSWORD`
-  调一次 `/api/v1/login/access-token`，把结果经 `/app/moviepilot/__mp/autologin.json`
-  交给页面头部注入的小脚本，由脚本写进 `localStorage` 的 `auth` / `user` 两个 store
-  （pinia 持久化键）。MoviePilot 自身的鉴权、权限、资源 Cookie 全部保持原样，**没有改一行上游代码**，
-  也不会被应用内自更新覆盖（自更新只换 `mp/` 与 `frontend/`）。
+- **怎么做的**：`frontend-server.js`（所有 HTML 的唯一产地）用 `app.env` 的
+  `SUPERUSER` / `SUPERUSER_PASSWORD` 调一次 `/api/v1/login/access-token`，把结果经
+  `/__mp/autologin.json` 交给页面头部注入的小脚本，由脚本写进 `localStorage` 的
+  `auth` / `user` 两个 store（pinia 持久化键）。MoviePilot 自身的鉴权、权限、资源
+  Cookie 全部保持原样，**没有改一行上游代码**，也不会被应用内自更新覆盖（自更新只换
+  `mp/` 与 `frontend/`）。
+- **两条访问路径都覆盖**：统一网关那条路（浏览器 → fnOS 网关 → unix socket →
+  `gateway-proxy` → 前端服务）和直连前端端口那条路（飞牛 APP、FN Connect 映射到应用
+  端口）最终都由前端服务吐出 `index.html`，所以注入点放在那里；代理只用
+  `X-MP-Gateway-Prefix` 告诉它页面挂在哪个前缀下，脚本据此优先请求
+  `/app/moviepilot/__mp/autologin.json`，直连时退回 `/__mp/autologin.json`。
+  > 早期版本把注入做在 `gateway-proxy` 里，直连端口那条路不经过代理，表现就是
+  > **局域网能免登录、外网（飞牛 APP / FN Connect）不能**。`tools/autologin_smoke.py`
+  > 的 J 组契约就是钉这个回归点。
 - **资源 Cookie 必须一起转发**：`system/message`、`system/logging` 这类 EventSource
   接口只认登录时下发的资源令牌 Cookie，不认 Bearer 头。少了它，界面能进但实时消息、
   系统日志会一直空着。
-- **令牌会自动续期**：到期前 10 分钟重新登录；代理启动时预热，避免"刚开机第一次打开
+- **令牌会自动续期**：到期前 10 分钟重新登录；服务启动时预热，避免"刚开机第一次打开
   仍是登录页"。
 - **失败一律降级**：密码被改过、开了二次验证、被登录限流时，端点返回
   `available=false`，页面就是普通登录页 —— 绝不白屏，也不会把密码或后端错误细节
@@ -113,8 +125,9 @@ appcenter-cli install-fpk moviepilot-<version>-amd64.fpk
 > 在 MoviePilot 界面里改过密码后，`app.env` 的 `SUPERUSER_PASSWORD` 也要同步修改，
 > 否则免登录会自动降级回登录页（日志里会写明代登录失败）。
 >
-> 排障：`app.log` 里搜「网关免登录」。三种落点——已启用 / 开关打开但缺凭据 /
-> 未启用；代登录失败会打印状态码与重试间隔，但不打印密码。
+> 排障：`app.log` 里搜 `[mp-autologin]`。四种落点——未启用 / 已启用（带账号与配置来源）
+> / 开关打开但缺凭据 / 代登录失败（带状态码与重试间隔，不含密码）；端点每次应答也会
+> 记一行 `available=`，所以"页面到底拿没拿到令牌"在服务端日志里能直接看到。
 > 临时联调可用环境变量覆盖 `app.env` 里的值（优先级更高，重启即失效）：
 > `MP_GATEWAY_AUTOLOGIN`、`MP_GATEWAY_AUTOLOGIN_USER`、`MP_GATEWAY_AUTOLOGIN_PASSWORD`。
 
@@ -195,7 +208,7 @@ python tools/supervisor_smoke.py
 python tools/pkgsize_smoke.py
 python tools/cmd_env_smoke.py     # 需 bash
 python tools/polyfill_smoke.py    # 需 node，缺失则 SKIP
-python tools/autologin_smoke.py   # 网关免登录（开关/端点/续期/失败降级），需 node 做语法校验
+python tools/autologin_smoke.py   # 网关免登录：起真实 node 前端服务 + 网关代理做端到端（需 node）
 ```
 
 ## 已知限制

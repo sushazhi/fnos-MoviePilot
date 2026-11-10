@@ -23,14 +23,11 @@ import os
 import signal
 import re
 import time
-import json
-import base64
 import threading
 import gzip
 import zlib
 import select
 import logging
-import urllib.parse
 from http.client import HTTPConnection
 from collections import OrderedDict
 
@@ -55,139 +52,6 @@ STATIC_EXTENSIONS = frozenset({
 _NO_CACHE_BASENAMES = frozenset({
     'service-worker.js', 'service.js', 'manifest.webmanifest', 'index.html',
 })
-
-# ---------------------------------------------------------------------------
-# 网关免登录（可选，默认关闭）
-# ---------------------------------------------------------------------------
-# 背景：本应用跑在 fnOS 统一网关后面，网关已经校验过 NAS 登录态；但 MoviePilot
-# 自己的登录态完全在浏览器里（pinia 的 `auth` / `user` store，persist 到
-# localStorage），所以用户点开应用仍然要再登一次。
-#
-# 开启 MP_GATEWAY_AUTOLOGIN 后，由本代理**代浏览器**登录一次（账号取 app.env 的
-# SUPERUSER / SUPERUSER_PASSWORD），把令牌经 `/__mp/autologin.json` 交给页面头部
-# 注入的脚本，由脚本写进 localStorage 的两个 store —— 效果是"点开即进"，而
-# MoviePilot 自身的鉴权链路（JWT、资源 Cookie、权限校验）一个字节都没改。
-#
-# 为什么不在前端直接登录、也不用 API_TOKEN：
-#   * API_TOKEN 走 `X-API-KEY` 只对 API 生效，且**不会**下发 EventSource 接口
-#     （system/message、system/logging）只认的资源令牌 Cookie，界面会"能打开但
-#     实时消息/日志空着"；
-#   * 前端拿密码自己登 = 明文密码躺进 HTML/JS，随缓存、快照、DevTools 外泄。
-#
-# 安全边界（务必如实告知用户）：开启后，任何能打开本应用（即已通过 fnOS 网关
-# 登录）的人都会拿到 MoviePilot 超级管理员身份 —— 这正是"跳过登录"的定义。
-# 多用户 NAS、或把飞牛面板暴露到公网时不要开。
-AUTOLOGIN_ENDPOINT = "/__mp/autologin.json"
-_AUTOLOGIN_JS_MARK = "__mp_autologin"
-
-
-def _read_app_env(path):
-    """最小 dotenv 解析：KEY=VALUE + `#` 注释 + 可选引号，后出现的键覆盖先出现的。
-
-    与上游 python-dotenv 的"后者生效"语义保持一致；解析失败一律当作没有配置，
-    绝不让一个坏行把代理整体拖垮（代理挂了 = 应用打不开）。
-    """
-    data = {}
-    if not path:
-        return data
-    try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            for raw in fh:
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key = key.strip()
-                if not key:
-                    continue
-                value = value.strip()
-                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                    value = value[1:-1]
-                data[key] = value
-    except OSError:
-        return {}
-    return data
-
-
-def _env_bool(value, default=False):
-    """把 app.env / 环境变量里的开关值解析成 bool（"0"/"false"/"off" 为假）。"""
-    if value is None or str(value).strip() == "":
-        return default
-    return str(value).strip().lower() in ("1", "true", "yes", "on")
-
-
-_ENV_FILE = os.environ.get("MP_APP_ENV") or (
-    os.path.join(os.environ["CONFIG_DIR"], "app.env")
-    if os.environ.get("CONFIG_DIR") else "")
-_APP_ENV = _read_app_env(_ENV_FILE)
-
-# 环境变量优先于 app.env：便于排障时临时覆盖，也让冒烟测试不必造文件。
-AUTOLOGIN_ENABLED = _env_bool(
-    os.environ.get("MP_GATEWAY_AUTOLOGIN") or _APP_ENV.get("MP_GATEWAY_AUTOLOGIN")
-)
-AUTOLOGIN_USER = (
-    os.environ.get("MP_GATEWAY_AUTOLOGIN_USER") or _APP_ENV.get("SUPERUSER") or ""
-).strip()
-AUTOLOGIN_PASSWORD = (
-    os.environ.get("MP_GATEWAY_AUTOLOGIN_PASSWORD")
-    or _APP_ENV.get("SUPERUSER_PASSWORD")
-    or ""
-)
-
-
-def _build_autologin_js():
-    """页面头部注入的引导脚本（静态内容，因此可被 Service Worker 缓存复用）。
-
-    设计要点：
-      * **已有登录态绝不覆盖** —— `auth` store 里已有 token 就什么都不做，
-        用户手动登录/登出、或用别的账号登录都不会被抢；
-      * 凭据走 XHR 现取现用，脚本本身不含令牌与密码，所以即使 index.html 被
-        SW 长期缓存、或令牌过期，重新加载也会拿到新令牌；
-      * 只有真正写到 localStorage 才 reload（写失败就不 reload，避免死循环）；
-        每次标签页会话最多尝试一次（sessionStorage 标记），登出后不会被立刻
-        拽回去；
-      * 用 XHR 而非 fetch：不依赖 polyfill 的改写顺序（URL 本身已带前缀）。
-    """
-    P = GATEWAY_PREFIX
-    E = AUTOLOGIN_ENDPOINT
-    return (
-        '<script>'
-        '/* %s */'
-        '(function(){'
-        'var P="%s",E="%s",K="mp_autologin_tried";'
-        'function has(){'
-        'try{var s=localStorage.getItem("auth");if(!s){return false;}'
-        'var o=JSON.parse(s);return !!(o&&o.token);}catch(e){return false;}}'
-        'if(has()){return;}'
-        'try{if(sessionStorage.getItem(K)==="1"){return;}'
-        'sessionStorage.setItem(K,"1");}catch(e){}'
-        'function apply(d){'
-        'if(!d||d.available!==true||!d.auth||!d.auth.token){return;}'
-        'try{'
-        'localStorage.setItem("auth",JSON.stringify(d.auth));'
-        'if(d.user){localStorage.setItem("user",JSON.stringify(d.user));}'
-        '}catch(e){return;}'
-        'try{location.reload();}catch(e){}'
-        '}'
-        'try{'
-        'var x=new XMLHttpRequest();'
-        'x.open("GET",P+E+"?t="+Date.now(),true);'
-        'x.withCredentials=true;'
-        'x.onload=function(){'
-        'if(x.status!==200){return;}'
-        'try{apply(JSON.parse(x.responseText));}catch(e){}'
-        '};'
-        'x.onerror=function(){};'
-        'x.send();'
-        '}catch(e){}'
-        '})();'
-        '</script>' % (_AUTOLOGIN_JS_MARK, P, E)
-    )
-
-
-_AUTOLOGIN_READY = bool(AUTOLOGIN_ENABLED and AUTOLOGIN_USER and AUTOLOGIN_PASSWORD)
-# 缺凭据时**不注入**脚本：注入了也只会换来一次 404，白白多一个请求。
-_AUTOLOGIN_JS_BYTES = _build_autologin_js().encode() if _AUTOLOGIN_READY else b""
 
 # 认证头改名（见 _build_polyfill 内的详细说明）。
 #   AUTH_HEADER     —— 后端（MoviePilot）认的请求头
@@ -323,267 +187,6 @@ if len(sys.argv) < 4:
 SOCK_PATH = sys.argv[1]
 TARGET_HOST = sys.argv[2]
 INITIAL_PORT = int(sys.argv[3])
-
-# ---------------------------------------------------------------------------
-# 自动登录会话（代浏览器登录 MoviePilot，缓存令牌）
-# ---------------------------------------------------------------------------
-# 前端 store 的形状是**跟着前端打包产物走的**，所以这里照抄 MoviePilot 前端的
-# pinia 定义（`auth` / `user` 两个 store，persist 键即 store id）：
-#   auth: {token, remember, originalPath}
-#   user: {superUser, userID, userName, avatar, level, permissions{...}}
-# 前端一旦改结构，本文件要跟着改 —— 失效表现是"又回到登录页"，不是白屏。
-_FRONTEND_PERMISSIONS_DEFAULT = {
-    "discovery": True,
-    "search": True,
-    "subscribe": True,
-    "manage": True,
-    "admin": True,
-    "features": {},
-}
-
-# 只转发 MoviePilot 自己的资源令牌 Cookie，避免把后端其它 Set-Cookie 带出去。
-_RESOURCE_COOKIE_NAME = "MoviePilot"
-
-
-class AutoLoginSession:
-    """代浏览器登录 MoviePilot，并把结果整理成前端 store 能直接吃的 JSON。
-
-    * 令牌到期前 REFRESH_MARGIN 秒提前续期，避免"用着用着突然跳登录页"；
-    * 登录失败（密码被用户改过、开了二次验证、被登录限流）时按退避重试，
-      并把**不含凭据**的原因交给前端脚本 —— 脚本只在 available=true 时才写
-      store，所以失败时表现为普通的登录页，而不是白屏或死循环；
-    * 全部状态用一把锁保护：ThreadingHTTPServer 下多个请求会并发打进来。
-    """
-
-    REFRESH_MARGIN = 600          # 提前 10 分钟续期
-    FAIL_BACKOFF = 60             # 普通失败：1 分钟内不再重试
-    THROTTLE_BACKOFF = 300        # 被限流（429）：5 分钟
-    WARM_INTERVAL = 2             # 启动预热的探测间隔（秒）
-    WARM_SECONDS = 120            # 启动预热最多持续多久（后端冷启动可能很慢）
-    TIMEOUT = 10
-    # 这些状态码代表"现在不行、过会儿可能行"（后端还没起来 / 网关后面重启中），
-    # 预热可以继续等；其余（401 密码不对、403、429 限流）是确定性失败，必须停手 ——
-    # 否则每 2s 撞一次登录接口，会把账号打进 MoviePilot 的登录限流，连人工登录
-    # 都会被挡在门外。
-    TRANSIENT_STATUS = frozenset({0, 500, 502, 503, 504})
-
-    def __init__(self, enabled, username, password, host, port):
-        self.enabled = bool(enabled and username and password)
-        self._username = username or ""
-        self._password = password or ""
-        self._host = host
-        self._port = port
-        self._lock = threading.Lock()
-        self._payload = None      # 上次成功的 JSON 载荷（缓存）
-        self._expire_at = 0.0     # 令牌绝对过期时间（time.time()）
-        self._next_try = 0.0      # 失败退避：早于此刻不重试
-        self._cookie = ""         # 资源令牌 Set-Cookie（原样转发给浏览器）
-        self._reason = ""         # 最近一次失败原因（仅排障日志用，不返回细节）
-        self._last_status = -1    # 最近一次登录的 HTTP 状态（0=连不上后端）
-        # 登录去重：同一时刻只允许一次 POST，其余请求等这个 Event
-        self._login_running = False
-        self._login_done = threading.Event()
-
-    # -- 内部 ---------------------------------------------------------------
-    @staticmethod
-    def _jwt_exp(token):
-        """从 JWT 里读 exp（不验签，只用于判断续期时机）。读不到返回 0。"""
-        try:
-            part = str(token).split(".")[1]
-            part += "=" * (-len(part) % 4)
-            payload = json.loads(base64.urlsafe_b64decode(part.encode()))
-            return float(payload.get("exp") or 0)
-        except Exception:
-            return 0.0
-
-    def _post_login(self):
-        """POST /api/v1/login/access-token，返回 (json_or_None, status, set_cookie)。
-
-        连不上后端时返回 status=0（而不是抛异常）：预热要靠这个值判断"该继续等"
-        还是"该停手"，异常会让两种情形混在一起。
-        """
-        form = urllib.parse.urlencode({
-            "username": self._username,
-            "password": self._password,
-        }).encode()
-        conn = HTTPConnection(self._host, self._port, timeout=self.TIMEOUT)
-        try:
-            conn.request(
-                "POST", "/api/v1/login/access-token", form,
-                {
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json",
-                    "Content-Length": str(len(form)),
-                    "Connection": "close",
-                },
-            )
-            resp = conn.getresponse()
-            raw = resp.read()
-            status = resp.status
-            cookie = ""
-            try:
-                for value in resp.msg.get_all("Set-Cookie") or []:
-                    if value.strip().startswith(_RESOURCE_COOKIE_NAME + "="):
-                        cookie = value
-                        break
-            except Exception:
-                cookie = ""
-        except (OSError, ValueError) as exc:
-            logging.debug("网关免登录：连接后端失败 %s", exc)
-            return None, 0, ""
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-        if status != 200:
-            return None, status, cookie
-        try:
-            return json.loads(raw.decode("utf-8", errors="replace")), status, cookie
-        except Exception:
-            return None, status, cookie
-
-    def _build_payload(self, data):
-        """"把登录响应整理成前端两个 store 的初始状态。"""
-        token = str(data.get("access_token") or "")
-        if not token:
-            return None
-        is_super = bool(data.get("super_user"))
-        raw_permissions = data.get("permissions")
-        permissions = dict(_FRONTEND_PERMISSIONS_DEFAULT)
-        if isinstance(raw_permissions, dict):
-            for key, value in raw_permissions.items():
-                if key == "features" and not isinstance(value, dict):
-                    continue
-                permissions[key] = value
-        # 超管在菜单过滤里靠 superUser 短路，这里仍把 manage/admin 显式打开，
-        # 避免个别页面直接读 permissions.manage。
-        if is_super:
-            permissions["manage"] = True
-            permissions["admin"] = True
-        try:
-            user_id = int(data.get("user_id"))
-        except (TypeError, ValueError):
-            user_id = -1
-        try:
-            level = int(data.get("level") or 1)
-        except (TypeError, ValueError):
-            level = 1
-        return {
-            "available": True,
-            "auth": {"token": token, "remember": True, "originalPath": None},
-            "user": {
-                "superUser": is_super,
-                "userID": user_id,
-                "userName": str(data.get("user_name") or self._username),
-                "avatar": str(data.get("avatar") or ""),
-                "level": level,
-                "permissions": permissions,
-            },
-        }
-
-    # -- 对外 ---------------------------------------------------------------
-    def state(self, force=False):
-        """返回 (给浏览器的 JSON, 要转发的 Set-Cookie)。
-
-        只有 enabled 且有可用令牌时 available 才为 true；其余情况一律返回
-        available=false，页面上就是普通登录页 —— "跳过登录"失败绝不阻断登录。
-        force=True 时忽略失败退避（仅供启动预热使用）。
-
-        登录本身在锁**外**执行：后端冷启动时一次 POST 可能耗到 TIMEOUT，持锁做
-        HTTP 会把所有并发端点请求一起堵住（页面头部脚本正好在首屏这时候发）。
-        并发靠 `_login_running/_login_done` 去重：同一时刻只有一次登录在飞，
-        其它请求等它的结果，不会各自打一遍登录接口。
-        """
-        if not self.enabled:
-            return {"available": False, "reason": "disabled"}, ""
-        now = time.time()
-        with self._lock:
-            if self._payload and self._expire_at - now > self.REFRESH_MARGIN:
-                return self._payload, self._cookie
-            if not force and now < self._next_try:
-                return {"available": False, "reason": "backoff"}, ""
-            running = self._login_running
-            if not running:
-                self._login_running = True
-
-        if running:
-            # 别人正在登录（预热或另一个标签页）：等结果，别再发一次
-            self._login_done.wait(self.TIMEOUT + 2)
-            with self._lock:
-                if self._payload and self._expire_at - time.time() > 0:
-                    return self._payload, self._cookie
-            return {"available": False, "reason": "in_progress"}, ""
-
-        try:
-            data, status, cookie = self._post_login()
-        finally:
-            with self._lock:
-                self._login_running = False
-                self._login_done.set()
-
-        with self._lock:
-            self._last_status = status
-            payload = self._build_payload(data) if data else None
-            if not payload:
-                # 429 = 登录限流；401 = 密码不对 / 需要二次验证（MFA）
-                backoff = self.THROTTLE_BACKOFF if status == 429 else self.FAIL_BACKOFF
-                self._next_try = time.time() + backoff
-                self._reason = "status=%s" % status
-                logging.warning(
-                    "网关免登录：代登录失败（%s），%ds 后重试；"
-                    "请检查 app.env 的 SUPERUSER / SUPERUSER_PASSWORD 是否与"
-                    "MoviePilot 当前密码一致，并确认该账号未开启二次验证",
-                    self._reason, backoff,
-                )
-                return {"available": False, "reason": "login_failed"}, ""
-
-            now = time.time()
-            expire_at = self._jwt_exp(payload["auth"]["token"])
-            if not expire_at:
-                # 令牌里有 exp，读不到就保守按 30 分钟算，保证会重新登录
-                expire_at = now + 1800
-            self._payload = payload
-            self._expire_at = expire_at
-            self._cookie = cookie
-            self._next_try = 0.0
-            self._reason = ""
-            logging.info("网关免登录：已获取 %s 的登录令牌（有效至 %s）",
-                         payload["user"]["userName"],
-                         time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expire_at)))
-            return self._payload, self._cookie
-
-    def warm(self):
-        """启动预热：把令牌先拿到手，浏览器第一次打开时端点就是一次内存读。
-
-        为什么不直接复用 state() 的失败退避：代理比 MoviePilot 后端先就绪是常态
-        （后端要跑完迁移才监听端口），若第一次探测失败就进入 60s 退避，用户在这
-        一分钟里打开应用仍会看到登录页。这里自己按固定节奏重试，成功后即结束。
-        """
-        if not self.enabled:
-            return
-        for _ in range(int(self.WARM_SECONDS / self.WARM_INTERVAL) or 1):
-            try:
-                payload, _cookie = self.state(force=True)
-            except Exception as exc:
-                logging.debug("网关免登录：预热异常 %s", exc)
-                payload = None
-                self._last_status = 0
-            if payload and payload.get("available"):
-                return
-            if self._last_status not in self.TRANSIENT_STATUS:
-                # 密码不对 / 被限流 / 返回了非 200 的确定性失败：交给 state() 的
-                # 退避处理，这里不再探测（详见 TRANSIENT_STATUS 的注释）
-                logging.warning(
-                    "网关免登录：预热放弃（status=%s），后续仅在用户打开应用时按"
-                    "退避重试", self._last_status)
-                return
-            time.sleep(self.WARM_INTERVAL)
-
-
-_AUTOLOGIN = AutoLoginSession(
-    AUTOLOGIN_ENABLED, AUTOLOGIN_USER, AUTOLOGIN_PASSWORD, TARGET_HOST, INITIAL_PORT,
-)
 
 # ---------------------------------------------------------------------------
 # 连接池
@@ -766,49 +369,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         return b"".join(chunks)
 
     def _rewrite_html(self, data):
-        # 自动登录脚本先注入：它要赶在 deferred 的模块脚本之前执行，但两者都在
-        # </head> 之前插入即可（classic script 天然早于 type="module"）。
-        if _AUTOLOGIN_JS_BYTES:
-            data = data.replace(b'</head>', _AUTOLOGIN_JS_BYTES + b'</head>', 1)
+        # 只做 URL 改写与 polyfill 注入。**免登录脚本不在这里注入** ——
+        # 注入点在前端服务（frontend-server.js）里，因为它是所有 HTML 的唯一产地：
+        # 统一网关这条路（本代理中转）和直连前端端口那一路（飞牛 APP、FN Connect
+        # 映射到应用端口）最终都由它吐 index.html。放在代理里注入时，直连那条路
+        # 根本不经过本代理，表现就是"局域网能免登录、外网不能"。
         data = data.replace(b'</head>', _POLYFILL_BYTES + b'</head>', 1)
         data = _RE_HTML_ATTR.sub(rb'\1=\2' + GATEWAY_PREFIX.encode() + rb'/', data)
         return data
-
-    def _serve_autologin(self):
-        """应答 `/__mp/autologin.json`：由代理自己出，不转发给前端/后端。
-
-        只回"够用且最小"的信息：令牌、用户身份、资源 Cookie。后端地址、错误
-        细节、密码一个字节都不出现 —— 这个端点的响应可能被浏览器缓存/被截图。
-        """
-        if self.command not in ("GET", "HEAD"):
-            self.send_response(405)
-            self.send_header("Allow", "GET, HEAD")
-            self.send_header("Content-Length", "0")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            return
-        try:
-            result, cookie = _AUTOLOGIN.state()
-        except Exception as exc:   # 兜底：任何意外都降级成普通登录页
-            logging.warning("网关免登录：生成登录状态异常: %s", exc)
-            result, cookie = {"available": False, "reason": "error"}, ""
-        body = json.dumps(result, ensure_ascii=False).encode("utf-8")
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            # 令牌绝不能被缓存：Service Worker / 磁盘缓存拿到旧令牌就等于登录失效
-            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Expires", "0")
-            if cookie:
-                self.send_header("Set-Cookie", cookie)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Connection", "close")
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
 
     def do_request(self):
         # 避免 HTTP/1.1 长连接在 BaseHTTPRequestHandler 中的 keep-alive 问题
@@ -827,12 +395,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         path = self._strip_prefix()
-
-        # 免登录凭据端点：开关打开时由代理应答（必须在取连接池之前返回，
-        # 否则会白白占用一条到前端的连接）
-        if _AUTOLOGIN.enabled and path.split("?", 1)[0] == AUTOLOGIN_ENDPOINT:
-            self._serve_autologin()
-            return
 
         is_head = self.command == "HEAD"
         port = INITIAL_PORT
@@ -860,6 +422,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         headers["Host"] = "%s:%d" % (TARGET_HOST, port)
         headers["Accept-Encoding"] = "gzip, deflate"
         headers["Accept"] = "*/*"
+        # 告诉前端服务"页面挂在哪个网关前缀下"：前端的免登录脚本要据此拼出
+        # `/app/moviepilot/__mp/autologin.json`。直连前端端口时没有这个头，
+        # 脚本就退回根路径 `/__mp/autologin.json` —— 两条访问路径同一份注入逻辑。
+        headers["X-MP-Gateway-Prefix"] = GATEWAY_PREFIX
         referer = self.headers.get("Referer", "")
         if referer:
             headers["Referer"] = _RE_REFERER.sub(backend_url, referer)
@@ -1176,25 +742,6 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT, cleanup)
     logging.info("gateway-proxy started: %s -> %s:%d", SOCK_PATH, TARGET_HOST, INITIAL_PORT)
-    # 免登录的状态必须在启动日志里留下痕迹：否则"开了开关却仍要登录"时，
-    # 排障只能靠猜（凭据缺失 / 密码与库里不一致，两种都在这里一眼看出）。
-    if AUTOLOGIN_ENABLED:
-        if _AUTOLOGIN.enabled:
-            logging.info("网关免登录：已启用（账号 %s，来源 %s）",
-                         AUTOLOGIN_USER or "(未配置)",
-                         _ENV_FILE or "(环境变量)")
-        else:
-            logging.warning(
-                "网关免登录：开关已打开，但缺少可用凭据（SUPERUSER=%r，"
-                "SUPERUSER_PASSWORD %s），本次按关闭处理",
-                AUTOLOGIN_USER, "已配置" if AUTOLOGIN_PASSWORD else "为空",
-            )
-    else:
-        logging.info("网关免登录：未启用（MP_GATEWAY_AUTOLOGIN=0）")
-    if _AUTOLOGIN.enabled:
-        # 后台预热：失败只记日志，绝不影响代理启动（代理起不来 = 应用打不开）
-        threading.Thread(target=_AUTOLOGIN.warm, name="autologin-warm",
-                         daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
