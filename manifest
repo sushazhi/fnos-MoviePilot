@@ -1,5 +1,5 @@
 appname               = moviepilot
-version               = 3.2.5
+version               = 3.2.7
 display_name          = MoviePilot
 desc                  = <b>NAS 媒体库自动化管理工具</b>，支持订阅、搜索、下载、媒体整理与刮削、媒体库刷新及消息通知等核心自动化流程。<br><br>🎬 <b>原生应用：</b>内置 Python 后端与 Web 前端，前后端运行于本地，通过 fnOS 统一网关嵌入桌面访问。
 
@@ -31,4 +31,4 @@ desktop_applaunchname = moviepilot.Application
 install_dep_apps      = nodejs_v24
 
 # 更新日志
-changelog             = v3.2.5<br>1.上游 MoviePilot v3.2.5 更新内容——以下汇总主项目 v3.2.4 发布后（北京时间 2026 年 11 月 4 日 07:54 起）的前后端及 App 变化；iOS App 采用独立版本号，目前为 v1.2.1；下载与订阅：保留合集中的真实集号，修复缺集被误记为已下载、订阅提前完成的问题；Transmission 临时通信故障支持自动重连重试；整理与网盘：完善远程存储覆盖整理时的临时文件命名，修复 115 等存储的重命名兼容问题<br>2.上游源码零改动原样集成，仅做 fnOS 打包适配（生命周期脚本、统一网关、桌面入口）<br>3.自带 CPython 3.14.8 运行时与全部依赖，安装时无需联网<br>4.本条目由 GitHub Actions 定时检查上游后自动生成
+changelog             = v3.2.7<br>1.上游 MoviePilot v3.2.7 更新内容——以下汇总主项目 v3.2.6 首次发布后（北京时间 2026 年 11 月 12 日 14:13 起）的前后端及 App 变化；iOS App 使用独立版本号，本次涉及 v1.2.…；通知与渠道授权：在用户管理中统一处理机器人使用申请、审批、权限及停用，支持关联已有网页账号，并迁移原有渠道白名单；修复微信、Slack、VoceChat、Synology Chat…；媒体识别与分类：共享并缓存非 T…<br>2.上游源码零改动原样集成，仅做 fnOS 打包适配（生命周期脚本、统一网关、桌面入口）<br>3.自带 CPython 3.14.8 运行时与全部依赖，安装时无需联网<br>4.本条目由 GitHub Actions 定时检查上游后自动生成
